@@ -1,6 +1,27 @@
 //! CSV / TSV parsing into a plain table (`headers` + `rows`).
 
-use super::Decoded;
+use super::{Decoded, Family, Format, Input};
+
+/// Formats this module handles (see [`crate::Format`]).
+pub(crate) const FORMATS: &[Format] = &[Format {
+    exts: &["csv", "tsv"],
+    family: Family::Text,
+    decode: csv_entry,
+}];
+
+fn csv_entry(input: Input) -> Decoded {
+    // Tab-separated for .tsv, comma otherwise.
+    let delim = if input
+        .path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("tsv"))
+    {
+        b'\t'
+    } else {
+        b','
+    };
+    decode_csv(&input.bytes, delim)
+}
 
 /// A decoded table. Intentionally free of view state (filtering, selection):
 /// that belongs to the consumer, not to the decoded data.

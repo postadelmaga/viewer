@@ -1,8 +1,31 @@
 //! Raster image and SVG decoding into raw RGBA (no GPU texture yet).
 
-use super::Decoded;
+use super::{Decoded, Family, Format, Input};
 use std::io::Cursor;
 use std::sync::OnceLock;
+
+/// Formats this module handles (see [`crate::Format`]). SVG is `Other` family —
+/// it's vector source, not a w·h·4 raster — while rasters use the image budget.
+pub(crate) const FORMATS: &[Format] = &[
+    Format {
+        exts: &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico"],
+        family: Family::Image,
+        decode: raster_entry,
+    },
+    Format {
+        exts: &["svg", "svgz"],
+        family: Family::Other,
+        decode: svg_entry,
+    },
+];
+
+fn raster_entry(input: Input) -> Decoded {
+    decode_image(&input.bytes)
+}
+
+fn svg_entry(input: Input) -> Decoded {
+    decode_svg(&input.bytes)
+}
 
 /// Max texture side most GL drivers accept, and a sane upper bound on area so a
 /// huge image doesn't keep tens of MB of RGBA around just to be shown shrunk.

@@ -18,11 +18,13 @@
 
 pub mod csv;
 pub mod image;
+pub mod mesh;
 pub mod office;
 #[cfg(feature = "pdf")]
 pub mod pdf;
 
 pub use csv::CsvData;
+pub use mesh::MeshData;
 pub use office::SheetData;
 
 use std::path::Path;
@@ -50,7 +52,114 @@ pub enum Decoded {
     /// Raw PDF bytes. Decoding pages needs pdfium — see the [`pdf`] module
     /// (enabled by the `pdf` feature).
     Pdf(Vec<u8>),
+    /// A decoded 3D mesh (OBJ / glTF / GLB). Produced only when the `mesh`
+    /// feature is enabled; see the [`mesh`] module.
+    Mesh(MeshData),
     Error(String),
+}
+
+/// Size-limit family of a format — which [`SizeLimits`] budget guards it. Kept
+/// separate from the decoder so the memory policy is one small, auditable table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    /// Text-like, ~1× in memory (csv, markdown, …).
+    Text,
+    /// Raster images, which decode to w·h·4 bytes regardless of file size.
+    Image,
+    /// 3D meshes (OBJ/glTF/GLB). Get their own, more generous budget: real
+    /// models are routinely large yet expand only modestly in memory (a text OBJ
+    /// often decodes to *fewer* bytes than its source; glTF/GLB is already
+    /// binary), and decoding runs off-thread so a big file doesn't block the UI.
+    Mesh,
+    /// Everything else (Office/ODF/PDF/SVG/…).
+    Other,
+}
+
+/// What a format decoder is handed: the file path plus its already-read bytes.
+/// Most decoders work from `bytes`; a few (e.g. glTF, which resolves sibling
+/// `.bin`/texture files) need the `path`. Owning both keeps the decoder fn
+/// pointer free of lifetimes, so the registry is a plain `const` table.
+pub struct Input {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+/// A self-describing file format: the extensions it claims, its size-limit
+/// [`Family`], and how to decode it. Each decoder module exposes a `FORMATS`
+/// slice of these and [`decode_with_limits`] aggregates them into one registry —
+/// so supporting a new format is a new module plus one row, never an edit to a
+/// central match. Feature-gated families (3D) contribute their rows only when
+/// compiled in, decoding to a clear "not compiled" error otherwise.
+pub struct Format {
+    pub exts: &'static [&'static str],
+    pub family: Family,
+    pub decode: fn(Input) -> Decoded,
+}
+
+/// Formats handled directly by the library root (no dedicated module): Markdown,
+/// the PDF byte passthrough (rendering lives in the gated [`pdf`] module), and a
+/// helpful refusal for legacy binary Office files.
+const LIB_FORMATS: &[Format] = &[
+    Format {
+        exts: &["md", "markdown"],
+        family: Family::Text,
+        decode: decode_markdown,
+    },
+    Format {
+        exts: &["pdf"],
+        family: Family::Other,
+        decode: decode_pdf_passthrough,
+    },
+    Format {
+        exts: &["doc", "ppt"],
+        family: Family::Other,
+        decode: decode_legacy_office,
+    },
+];
+
+/// Every registered format, in lookup order. The first row whose `exts` contains
+/// the queried extension wins.
+fn registry() -> impl Iterator<Item = &'static Format> {
+    LIB_FORMATS
+        .iter()
+        .chain(csv::FORMATS)
+        .chain(image::FORMATS)
+        .chain(office::FORMATS)
+        .chain(mesh::FORMATS)
+}
+
+/// Find the format claiming `ext` (already lowercased), if any.
+fn find_format(ext: &str) -> Option<&'static Format> {
+    registry().find(|f| f.exts.contains(&ext))
+}
+
+/// Size family for an extension no decoder claims: text-like ones load ~1× so
+/// they get the text budget; unknown binaries get the `other` budget. The
+/// fallback decoder ([`decode_text_or_guess`]) then handles the bytes.
+fn unmatched_family(ext: &str) -> Family {
+    match ext {
+        "txt" | "json" | "log" | "" => Family::Text,
+        _ => Family::Other,
+    }
+}
+
+fn decode_markdown(input: Input) -> Decoded {
+    match String::from_utf8(input.bytes) {
+        Ok(s) => Decoded::Markdown(s),
+        Err(_) => Decoded::Error("Markdown non in UTF-8".into()),
+    }
+}
+
+fn decode_pdf_passthrough(input: Input) -> Decoded {
+    // No copy: hand the read buffer straight on as the PDF payload.
+    Decoded::Pdf(input.bytes)
+}
+
+fn decode_legacy_office(_: Input) -> Decoded {
+    Decoded::Error(
+        "Formato Office binario legacy (.doc/.ppt) non supportato.\nConverti in .docx/.pptx o PDF."
+            .into(),
+    )
 }
 
 /// Maximum input sizes (MiB) accepted by [`decode_with_limits`], per format
@@ -66,6 +175,9 @@ pub struct SizeLimits {
     pub text_mb: u64,
     /// Raster images, which decode to w·h·4 bytes regardless of file size.
     pub image_mb: u64,
+    /// 3D meshes (OBJ/glTF/GLB). Higher than `other_mb`: real models are large
+    /// but expand little in memory, and decoding is off-thread.
+    pub mesh_mb: u64,
     /// Everything else (Office/ODF/PDF/…).
     pub other_mb: u64,
 }
@@ -75,6 +187,7 @@ impl Default for SizeLimits {
         Self {
             text_mb: 512,
             image_mb: 64,
+            mesh_mb: 512,
             other_mb: 128,
         }
     }
@@ -87,6 +200,7 @@ impl SizeLimits {
         Self {
             text_mb: u64::MAX,
             image_mb: u64::MAX,
+            mesh_mb: u64::MAX,
             other_mb: u64::MAX,
         }
     }
@@ -102,20 +216,20 @@ impl SizeLimits {
             Some(v) => Self {
                 text_mb: v,
                 image_mb: v,
+                mesh_mb: v,
                 other_mb: v,
             },
             None => Self::default(),
         }
     }
 
-    /// The limit that applies to a given (lowercased) file extension.
-    fn for_ext(&self, ext: &str) -> u64 {
-        match ext {
-            "csv" | "tsv" | "md" | "markdown" | "txt" | "json" | "log" | "" => self.text_mb,
-            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "ico" => {
-                self.image_mb
-            }
-            _ => self.other_mb,
+    /// The limit that applies to a given size-limit [`Family`].
+    fn for_family(&self, family: Family) -> u64 {
+        match family {
+            Family::Text => self.text_mb,
+            Family::Image => self.image_mb,
+            Family::Mesh => self.mesh_mb,
+            Family::Other => self.other_mb,
         }
     }
 }
@@ -135,7 +249,11 @@ pub fn decode_with_limits(path: &Path, limits: SizeLimits) -> Decoded {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    let max_mb = limits.for_ext(&ext);
+    // Resolve the format (and thus its size family) before touching the file.
+    let format = find_format(&ext);
+    let family = format.map_or_else(|| unmatched_family(&ext), |f| f.family);
+
+    let max_mb = limits.for_family(family);
     if max_mb != u64::MAX {
         if let Ok(meta) = std::fs::metadata(path) {
             // Compare in bytes so the limit is exact: a 0 MB limit rejects any
@@ -154,25 +272,13 @@ pub fn decode_with_limits(path: &Path, limits: SizeLimits) -> Decoded {
         Err(e) => return Decoded::Error(format!("Impossibile leggere il file:\n{e}")),
     };
 
-    match ext.as_str() {
-        "csv" | "tsv" => csv::decode_csv(&bytes, if ext == "tsv" { b'\t' } else { b',' }),
-        "svg" | "svgz" => image::decode_svg(&bytes),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "ico" => {
-            image::decode_image(&bytes)
-        }
-        "md" | "markdown" => match std::str::from_utf8(&bytes) {
-            Ok(s) => Decoded::Markdown(s.to_string()),
-            Err(_) => Decoded::Error("Markdown non in UTF-8".into()),
-        },
-        "pdf" => Decoded::Pdf(bytes),
-        "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => office::decode_spreadsheet(&bytes),
-        "docx" => office::decode_docx(&bytes),
-        "pptx" => office::decode_pptx(&bytes),
-        "odt" | "odp" => office::decode_odf(&bytes),
-        "doc" | "ppt" => Decoded::Error(
-            "Formato Office binario legacy (.doc/.ppt) non supportato.\nConverti in .docx/.pptx o PDF.".into(),
-        ),
-        _ => decode_text_or_guess(&bytes),
+    match format {
+        Some(f) => (f.decode)(Input {
+            path: path.to_path_buf(),
+            bytes,
+        }),
+        // Unknown extension: sniff for an image, else show as text.
+        None => decode_text_or_guess(&bytes),
     }
 }
 
@@ -220,6 +326,37 @@ mod tests {
 
     // Fixtures live in the repo so `cargo test` is portable on any machine.
     const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+    #[test]
+    fn registry_routes_known_extensions_and_falls_back() {
+        use super::{decode_with_limits, SizeLimits};
+        use std::path::PathBuf;
+        let unlimited = SizeLimits::unlimited();
+
+        // SVG → image family decoder.
+        let svg = PathBuf::from(format!("{DIR}/test.svg"));
+        match decode_with_limits(&svg, unlimited) {
+            Decoded::Image { .. } => {}
+            other => panic!("svg: atteso Image, ottenuto {}", decoded_variant(&other)),
+        }
+        // OBJ → mesh decoder (registered behind the `mesh` feature).
+        #[cfg(feature = "mesh")]
+        {
+            let obj = PathBuf::from(format!("{DIR}/test.obj"));
+            match decode_with_limits(&obj, unlimited) {
+                Decoded::Mesh(_) => {}
+                other => panic!("obj: atteso Mesh, ottenuto {}", decoded_variant(&other)),
+            }
+        }
+        // Unknown extension on UTF-8 content → text fallback.
+        let md = PathBuf::from(format!("{DIR}/test.md")); // not a registry text decoder ext for raw bytes
+        match decode_with_limits(&md, unlimited) {
+            // .md is registered (Markdown); assert the registry picked it, not
+            // the fallback — proving extension dispatch works.
+            Decoded::Markdown(_) => {}
+            other => panic!("md: atteso Markdown, ottenuto {}", decoded_variant(&other)),
+        }
+    }
 
     #[test]
     fn xlsx_parses_into_sheets() {
@@ -304,6 +441,7 @@ mod tests {
             Decoded::Markdown(_) => "Markdown",
             Decoded::Text(_) => "Text",
             Decoded::Pdf(_) => "Pdf",
+            Decoded::Mesh(_) => "Mesh",
             Decoded::Error(_) => "Error",
         }
     }

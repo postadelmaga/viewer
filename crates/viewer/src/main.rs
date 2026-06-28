@@ -104,6 +104,9 @@ fn main() -> eframe::Result<()> {
     };
     let options = eframe::NativeOptions {
         viewport,
+        // A depth buffer so the 3D mesh view can occlude correctly; harmless and
+        // cheap for the 2D content types (egui draws without depth).
+        depth_buffer: 24,
         ..Default::default()
     };
 

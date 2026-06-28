@@ -1,8 +1,45 @@
 //! Office / OpenDocument: spreadsheets to tables, documents/slides to text.
 
 use super::csv::CsvData;
-use super::Decoded;
+use super::{Decoded, Family, Format, Input};
 use std::io::{Cursor, Read};
+
+/// Formats this module handles (see [`crate::Format`]).
+pub(crate) const FORMATS: &[Format] = &[
+    Format {
+        exts: &["xlsx", "xlsm", "xlsb", "xls", "ods"],
+        family: Family::Other,
+        decode: spreadsheet_entry,
+    },
+    Format {
+        exts: &["docx"],
+        family: Family::Other,
+        decode: docx_entry,
+    },
+    Format {
+        exts: &["pptx"],
+        family: Family::Other,
+        decode: pptx_entry,
+    },
+    Format {
+        exts: &["odt", "odp"],
+        family: Family::Other,
+        decode: odf_entry,
+    },
+];
+
+fn spreadsheet_entry(input: Input) -> Decoded {
+    decode_spreadsheet(&input.bytes)
+}
+fn docx_entry(input: Input) -> Decoded {
+    decode_docx(&input.bytes)
+}
+fn pptx_entry(input: Input) -> Decoded {
+    decode_pptx(&input.bytes)
+}
+fn odf_entry(input: Input) -> Decoded {
+    decode_odf(&input.bytes)
+}
 
 /// A spreadsheet workbook: one named [`CsvData`] table per sheet. Sheet
 /// selection is a view concern and is left to the consumer.

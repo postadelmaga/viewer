@@ -1,6 +1,7 @@
 //! Application state and the egui update loop.
 
 use crate::ui::image_view::{image_view, ImageView};
+use crate::ui::mesh_view::{mesh_view, MeshView};
 use crate::ui::pdf_view::{prepare_pdf, PdfView};
 use crate::ui::table::{csv_table, csv_toolbar, CsvView, SheetView};
 use crate::{bench, wake_ui};
@@ -20,6 +21,7 @@ pub(crate) enum Content {
     Image(ImageView),
     Markdown(String),
     Pdf(PdfView),
+    Mesh(MeshView),
     Text(String),
     Error(String),
 }
@@ -156,7 +158,7 @@ impl App {
                 &[
                     "csv", "tsv", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "svg",
                     "xlsx", "xlsm", "xlsb", "xls", "ods", "docx", "pptx", "odt", "odp", "pdf",
-                    "md", "markdown",
+                    "md", "markdown", "obj", "gltf", "glb",
                 ],
             )
             .add_filter("Tutti i file", &["*"])
@@ -196,6 +198,14 @@ impl App {
                     view.offset = Vec2::ZERO;
                 }
             }
+            Content::Mesh(view) => {
+                ui.label(&view.kind);
+                ui.separator();
+                if ui.button("Adatta").clicked() {
+                    view.reset();
+                }
+                ui.label("trascina = ruota · rotella = zoom");
+            }
             Content::Pdf(pdf) => {
                 if ui.button("◀").clicked() && pdf.page > 0 {
                     pdf.page -= 1;
@@ -232,6 +242,7 @@ fn build_content(ctx: &egui::Context, decoded: Decoded) -> Content {
         Decoded::Markdown(s) => Content::Markdown(s),
         Decoded::Text(s) => Content::Text(s),
         Decoded::Pdf(bytes) => Content::Pdf(prepare_pdf(bytes)),
+        Decoded::Mesh(m) => Content::Mesh(MeshView::new(m)),
         Decoded::Error(e) => Content::Error(e),
         Decoded::Image {
             rgba,
@@ -270,12 +281,14 @@ fn content_displayable(c: &Content) -> bool {
     match c {
         Content::Empty => false,
         Content::Pdf(p) => p.view.is_some() || p.error.is_some(),
+        // The mesh paints once its GPU upload happens (next frame), but it's
+        // effectively ready as soon as we hold the geometry.
         _ => true,
     }
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let is_first = self.first_frame;
 
         // Files handed over by later invocations (single instance).
@@ -449,6 +462,7 @@ impl eframe::App for App {
             Content::Csv(data) => csv_table(ui, data),
             Content::Sheets(sd) => csv_table(ui, &sd.sheets[sd.current].1),
             Content::Image(view) => image_view(ui, view),
+            Content::Mesh(view) => mesh_view(ui, view, frame.gl()),
             Content::Markdown(text) => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.md_cache, text);
@@ -526,6 +540,14 @@ impl eframe::App for App {
             if std::env::var_os("VIEWER_BENCH").is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+    }
+
+    /// Free GPU resources the egui texture manager doesn't own (the 3D mesh's
+    /// buffers/program) while the glow context is still alive.
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Content::Mesh(view), Some(gl)) = (&self.content, gl) {
+            view.destroy(gl);
         }
     }
 }
