@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/viewer-core", "crates/viewer"]
+
+# Release profile lives at the workspace root so it applies to every member
+# (the binary and the library). Tuned for fast startup and a small binary.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
