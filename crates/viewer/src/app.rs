@@ -432,17 +432,29 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.content {
             Content::Empty => {
-                ui.centered_and_justified(|ui| {
-                    if self.pending_load.is_some() {
-                        // Static label (not an animated spinner) so the decode
-                        // worker isn't starved by continuous repaints.
-                        ui.label("Caricamento…");
-                    } else {
+                if self.pending_load.is_some() {
+                    ui.centered_and_justified(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.add_space(6.0);
+                            let name = &self.file_name;
+                            ui.label(if name.is_empty() {
+                                "Caricamento…".to_string()
+                            } else {
+                                format!("Caricamento di {name}…")
+                            });
+                        });
+                    });
+                    // Animate the spinner while decoding. Throttled to ~30 fps so
+                    // the UI thread barely competes with the decode worker.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                } else {
+                    ui.centered_and_justified(|ui| {
                         ui.label(
-                            "Trascina qui un file: CSV, immagine, SVG, Excel/Word/PowerPoint\n(oppure premi Apri / Ctrl+O)",
+                            "Trascina qui un file: CSV, immagine, SVG, Excel/Word/PowerPoint, PDF, 3D (OBJ/glTF)\n(oppure premi Apri / Ctrl+O)",
                         );
-                    }
-                });
+                    });
+                }
             }
             Content::Error(e) => {
                 ui.centered_and_justified(|ui| {

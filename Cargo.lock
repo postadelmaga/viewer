@@ -3645,15 +3645,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tobj"
-version = "4.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2da83817ac7401436633efc35c19edae9f326fa741fae775a1caa406de9db07c"
-dependencies = [
- "ahash",
-]
-
-[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3932,7 +3923,6 @@ dependencies = [
  "pdfium-render",
  "quick-xml 0.36.2",
  "resvg",
- "tobj",
  "zip",
 ]
 

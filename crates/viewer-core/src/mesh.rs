@@ -70,6 +70,15 @@ pub struct MeshData {
     pub kind: String,
 }
 
+/// Phase timing for the decode path, printed to stderr only when `VIEWER_BENCH`
+/// is set (same gate the app uses). Free in normal use.
+#[cfg(feature = "mesh")]
+pub(crate) fn mesh_bench(label: &str, d: std::time::Duration) {
+    if std::env::var_os("VIEWER_BENCH").is_some() {
+        eprintln!("BENCH mesh_{label}_ms={:.1}", d.as_secs_f64() * 1000.0);
+    }
+}
+
 #[cfg(feature = "mesh")]
 impl MeshData {
     /// Assemble from positions, optional normals and triangle indices. Normals
@@ -81,15 +90,19 @@ impl MeshData {
         indices: Vec<u32>,
         kind: String,
     ) -> Decoded {
+        use std::time::Instant;
         if positions.is_empty() || indices.len() < 3 {
             return Decoded::Error("Modello 3D senza geometria triangolare.".into());
         }
 
+        let t = Instant::now();
         let normals = match normals {
             Some(n) if n.len() == positions.len() => n,
             _ => compute_normals(&positions, &indices),
         };
+        mesh_bench("normals", t.elapsed());
 
+        let t = Instant::now();
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         let mut vertices = Vec::with_capacity(positions.len() * 6);
@@ -100,6 +113,7 @@ impl MeshData {
             }
             vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
         }
+        mesh_bench("interleave", t.elapsed());
         // A model whose coordinates are all NaN/inf would leave the box unset.
         if !min.iter().chain(max.iter()).all(|v| v.is_finite()) {
             return Decoded::Error("Modello 3D con coordinate non valide.".into());
@@ -174,56 +188,251 @@ fn tri_label(tris: usize) -> String {
 }
 
 /// Decode a Wavefront OBJ from memory. All objects/groups are merged into one
-/// mesh; materials and `.mtl` files are ignored (geometry only). Triangulated
-/// and de-indexed to a single shared index buffer.
+/// mesh; materials/`.mtl` and texture coords are ignored (geometry only).
+/// Faces are fan-triangulated.
+///
+/// The parse is the whole cost of loading an OBJ (text → millions of floats), so
+/// it runs **multi-threaded**: the file is split into line-aligned chunks parsed
+/// in parallel (positions/normals in pass 1, faces in pass 2). When the file has
+/// no normals we keep the compact indexed form and synthesise normals; when it
+/// does, we expand per-corner (avoiding any vertex-dedup hashing).
 #[cfg(feature = "mesh")]
 pub fn decode_obj(bytes: &[u8]) -> Decoded {
-    use std::io::Cursor;
+    let t = std::time::Instant::now();
+    let (positions, normals, indices) = parse_obj(bytes);
+    mesh_bench("obj_parse", t.elapsed());
 
-    let opts = tobj::LoadOptions {
-        triangulate: true,
-        single_index: true,
-        ignore_points: true,
-        ignore_lines: true,
-    };
-    // We render geometry only: satisfy any `mtllib` reference with empty
-    // materials rather than failing the whole load on a missing `.mtl`.
-    let mut reader = Cursor::new(bytes);
-    let (models, _) = match tobj::load_obj_buf(&mut reader, &opts, |_| {
-        Ok((Vec::new(), Default::default()))
-    }) {
-        Ok(r) => r,
-        Err(e) => return Decoded::Error(format!("OBJ non leggibile:\n{e}")),
-    };
-
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    let mut all_have_normals = true;
-
-    for model in &models {
-        let mesh = &model.mesh;
-        let base = positions.len() as u32;
-        for p in mesh.positions.chunks_exact(3) {
-            positions.push([p[0], p[1], p[2]]);
-        }
-        if mesh.normals.len() == mesh.positions.len() {
-            for n in mesh.normals.chunks_exact(3) {
-                normals.push([n[0], n[1], n[2]]);
-            }
-        } else {
-            all_have_normals = false;
-        }
-        indices.extend(mesh.indices.iter().map(|i| base + i));
+    if positions.is_empty() || indices.len() < 3 {
+        return Decoded::Error("OBJ senza geometria triangolare.".into());
     }
-
-    let normals = if all_have_normals && normals.len() == positions.len() {
-        Some(normals)
-    } else {
-        None
-    };
     let kind = format!("OBJ · {}", tri_label(indices.len() / 3));
     MeshData::build(positions, normals, indices, kind)
+}
+
+/// Split `bytes` into at most `n` line-aligned `[start, end)` ranges (each range
+/// holds whole lines), so chunks can be parsed independently.
+#[cfg(feature = "mesh")]
+fn split_lines(bytes: &[u8], n: usize) -> Vec<(usize, usize)> {
+    let len = bytes.len();
+    if len == 0 || n <= 1 {
+        return vec![(0, len)];
+    }
+    let mut bounds = vec![0usize];
+    for i in 1..n {
+        let mut p = (len * i / n).min(len);
+        // Advance to just after the next newline so we never split a line.
+        while p < len && bytes[p - 1] != b'\n' {
+            p += 1;
+        }
+        if p > *bounds.last().unwrap() {
+            bounds.push(p);
+        }
+    }
+    bounds.push(len);
+    bounds.windows(2).map(|w| (w[0], w[1])).filter(|(a, b)| a < b).collect()
+}
+
+#[cfg(feature = "mesh")]
+fn strip_cr(line: &[u8]) -> &[u8] {
+    match line.last() {
+        Some(b'\r') => &line[..line.len() - 1],
+        _ => line,
+    }
+}
+
+/// Parse the first three whitespace-separated floats of `b` (a `v`/`vn` payload).
+#[cfg(feature = "mesh")]
+fn parse_vec3(b: &[u8]) -> Option<[f32; 3]> {
+    let s = std::str::from_utf8(b).ok()?;
+    let mut it = s.split_ascii_whitespace();
+    let x = it.next()?.parse().ok()?;
+    let y = it.next()?.parse().ok()?;
+    let z = it.next()?.parse().ok()?;
+    Some([x, y, z])
+}
+
+/// Resolve an OBJ index token (1-based, negative = relative to items seen so far)
+/// to a 0-based absolute index. `count` is how many such items are defined up to
+/// this point in the file.
+#[cfg(feature = "mesh")]
+fn resolve_index(tok: &[u8], count: usize) -> Option<usize> {
+    let s = std::str::from_utf8(tok).ok()?;
+    let v: i64 = s.parse().ok()?;
+    if v > 0 {
+        Some((v - 1) as usize)
+    } else if v < 0 {
+        (count as i64 + v).try_into().ok()
+    } else {
+        None
+    }
+}
+
+/// Full parallel OBJ parse. Returns `(positions, normals, indices)` where either
+/// `normals` is `None` (compact indexed mesh, normals synthesised later) or
+/// `Some` aligned per-vertex with an expanded `positions` (sequential indices).
+#[cfg(feature = "mesh")]
+#[allow(clippy::type_complexity)]
+fn parse_obj(bytes: &[u8]) -> (Vec<[f32; 3]>, Option<Vec<[f32; 3]>>, Vec<u32>) {
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    parse_obj_n(bytes, nthreads)
+}
+
+/// [`parse_obj`] with an explicit chunk/thread count (so tests can exercise the
+/// chunk-boundary logic deterministically).
+#[cfg(feature = "mesh")]
+#[allow(clippy::type_complexity)]
+fn parse_obj_n(bytes: &[u8], nthreads: usize) -> (Vec<[f32; 3]>, Option<Vec<[f32; 3]>>, Vec<u32>) {
+    let chunks = split_lines(bytes, nthreads.max(1));
+
+    // Pass 1 (parallel): positions and normals per chunk, in file order.
+    let per_chunk: Vec<(Vec<[f32; 3]>, Vec<[f32; 3]>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|&(a, b)| {
+                s.spawn(move || {
+                    let mut pos = Vec::new();
+                    let mut nrm = Vec::new();
+                    for line in bytes[a..b].split(|&c| c == b'\n') {
+                        let line = strip_cr(line);
+                        if let Some(rest) = line.strip_prefix(b"v ") {
+                            if let Some(p) = parse_vec3(rest) {
+                                pos.push(p);
+                            }
+                        } else if let Some(rest) = line.strip_prefix(b"vn ") {
+                            if let Some(nv) = parse_vec3(rest) {
+                                nrm.push(nv);
+                            }
+                        }
+                    }
+                    (pos, nrm)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Concatenate to global arrays; remember each chunk's starting offsets so
+    // pass 2 can resolve absolute and relative (negative) face indices.
+    let mut v_off = Vec::with_capacity(chunks.len());
+    let mut vn_off = Vec::with_capacity(chunks.len());
+    let (mut nv, mut nn) = (0usize, 0usize);
+    for (p, n) in &per_chunk {
+        v_off.push(nv);
+        vn_off.push(nn);
+        nv += p.len();
+        nn += n.len();
+    }
+    let mut positions = Vec::with_capacity(nv);
+    let mut normals = Vec::with_capacity(nn);
+    for (p, n) in &per_chunk {
+        positions.extend_from_slice(p);
+        normals.extend_from_slice(n);
+    }
+    let has_normals = !normals.is_empty();
+
+    // Pass 2 (parallel): faces. Per chunk, re-walk lines counting v/vn (to track
+    // the running totals for negative indices) and emit triangles.
+    let positions = &positions;
+    let normals = &normals;
+    let results: Vec<(Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .enumerate()
+            .map(|(ci, &(a, b))| {
+                let v_base = v_off[ci];
+                let vn_base = vn_off[ci];
+                s.spawn(move || {
+                    let mut run_v = v_base;
+                    let mut run_vn = vn_base;
+                    let mut idx: Vec<u32> = Vec::new();
+                    let mut epos: Vec<[f32; 3]> = Vec::new();
+                    let mut enrm: Vec<[f32; 3]> = Vec::new();
+                    // Scratch reused per face to avoid per-line allocation.
+                    let mut corner_v: Vec<usize> = Vec::new();
+                    let mut corner_n: Vec<Option<usize>> = Vec::new();
+
+                    for line in bytes[a..b].split(|&c| c == b'\n') {
+                        let line = strip_cr(line);
+                        if line.strip_prefix(b"v ").is_some() {
+                            run_v += 1;
+                        } else if line.strip_prefix(b"vn ").is_some() {
+                            run_vn += 1;
+                        } else if let Some(rest) = line.strip_prefix(b"f ") {
+                            corner_v.clear();
+                            corner_n.clear();
+                            for tok in rest.split(|&c| c == b' ' || c == b'\t') {
+                                if tok.is_empty() {
+                                    continue;
+                                }
+                                let mut parts = tok.split(|&c| c == b'/');
+                                let vtok = parts.next().unwrap_or(b"");
+                                let _vt = parts.next();
+                                let vntok = parts.next();
+                                let vi = match resolve_index(vtok, run_v) {
+                                    Some(i) if i < positions.len() => i,
+                                    _ => {
+                                        corner_v.clear();
+                                        break; // malformed face: drop it
+                                    }
+                                };
+                                let ni = vntok.and_then(|t| {
+                                    if t.is_empty() {
+                                        None
+                                    } else {
+                                        resolve_index(t, run_vn).filter(|&i| i < normals.len())
+                                    }
+                                });
+                                corner_v.push(vi);
+                                corner_n.push(ni);
+                            }
+                            // Fan-triangulate the polygon.
+                            if corner_v.len() >= 3 {
+                                for k in 1..corner_v.len() - 1 {
+                                    for &c in &[0usize, k, k + 1] {
+                                        if has_normals {
+                                            epos.push(positions[corner_v[c]]);
+                                            enrm.push(match corner_n[c] {
+                                                Some(n) => normals[n],
+                                                None => [0.0, 0.0, 0.0],
+                                            });
+                                        } else {
+                                            idx.push(corner_v[c] as u32);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (epos, enrm, idx)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    if has_normals {
+        // Expanded per-corner mesh: concat positions/normals, sequential indices.
+        let total: usize = results.iter().map(|(p, _, _)| p.len()).sum();
+        let mut epos = Vec::with_capacity(total);
+        let mut enrm = Vec::with_capacity(total);
+        for (p, n, _) in &results {
+            epos.extend_from_slice(p);
+            enrm.extend_from_slice(n);
+        }
+        let indices: Vec<u32> = (0..epos.len() as u32).collect();
+        (epos, Some(enrm), indices)
+    } else {
+        // Compact indexed mesh over the shared position array.
+        let total: usize = results.iter().map(|(_, _, i)| i.len()).sum();
+        let mut indices = Vec::with_capacity(total);
+        for (_, _, i) in &results {
+            indices.extend_from_slice(i);
+        }
+        (positions.clone(), None, indices)
+    }
 }
 
 /// Decode glTF 2.0 — text `.gltf` (with embedded or sibling buffers) or binary
@@ -410,6 +619,70 @@ f 1 3 4
             }
             other => panic!("atteso Mesh, ottenuto {other:?}", other = variant(&other)),
         }
+    }
+
+    #[test]
+    fn obj_with_normals_expands_per_corner() {
+        // A triangle carrying explicit normals (v//vn) → expanded path: 3
+        // vertices, normals taken from the file (here +Z), not recomputed.
+        let obj = "\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vn 0 0 1
+f 1//1 2//1 3//1
+";
+        match decode_obj(obj.as_bytes()) {
+            Decoded::Mesh(m) => {
+                assert_eq!(m.indices.len(), 3);
+                assert_eq!(m.vertices.len(), 3 * 6);
+                for v in m.vertices.chunks_exact(6) {
+                    assert_eq!([v[3], v[4], v[5]], [0.0, 0.0, 1.0], "normale dal file");
+                }
+            }
+            other => panic!("atteso Mesh, ottenuto {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn obj_handles_negative_indices_and_quads() {
+        // A quad addressed with negative (relative) indices; must triangulate to
+        // two triangles over the four positions.
+        let obj = "\
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+f -4 -3 -2 -1
+";
+        match decode_obj(obj.as_bytes()) {
+            Decoded::Mesh(m) => {
+                assert_eq!(m.indices.len(), 6, "quad → due triangoli");
+                assert_eq!(m.vertices.len(), 4 * 6, "quattro posizioni condivise");
+                // All indices must be in range of the four vertices.
+                assert!(m.indices.iter().all(|&i| i < 4));
+            }
+            other => panic!("atteso Mesh, ottenuto {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn obj_parses_consistently_across_chunk_counts() {
+        // Same model parsed whole vs split: the parallel path must agree with a
+        // single-chunk parse on triangle count (boundary-safety of split_lines).
+        let mut obj = String::from("# grid\n");
+        for i in 0..50 {
+            obj.push_str(&format!("v {i} 0 0\nv {i} 1 0\n"));
+        }
+        for i in 0..49 {
+            let a = i * 2 + 1;
+            obj.push_str(&format!("f {} {} {}\n", a, a + 1, a + 2));
+        }
+        let one = parse_obj_n(obj.as_bytes(), 1);
+        let many = parse_obj_n(obj.as_bytes(), 8);
+        assert_eq!(one.0.len(), many.0.len(), "stesse posizioni");
+        assert_eq!(one.2, many.2, "stessi indici risolti");
+        assert!(!one.2.is_empty(), "geometria non vuota");
     }
 
     #[test]
