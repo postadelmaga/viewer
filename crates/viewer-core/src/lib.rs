@@ -133,6 +133,23 @@ fn find_format(ext: &str) -> Option<&'static Format> {
     registry().find(|f| f.exts.contains(&ext))
 }
 
+/// Every file extension claimed by a registered format, deduplicated and in
+/// registry order. A file-open dialog or "supported formats" listing should
+/// derive its filter from this rather than hard-coding one: adding a format
+/// (a new `FORMATS` row) then updates that UI automatically, so the registry
+/// and the dialog can't silently drift apart.
+pub fn supported_extensions() -> Vec<&'static str> {
+    let mut exts: Vec<&'static str> = Vec::new();
+    for format in registry() {
+        for &ext in format.exts {
+            if !exts.contains(&ext) {
+                exts.push(ext);
+            }
+        }
+    }
+    exts
+}
+
 /// Size family for an extension no decoder claims: text-like ones load ~1× so
 /// they get the text budget; unknown binaries get the `other` budget. The
 /// fallback decoder ([`decode_text_or_guess`]) then handles the bytes.
@@ -326,6 +343,25 @@ mod tests {
 
     // Fixtures live in the repo so `cargo test` is portable on any machine.
     const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+    #[test]
+    fn supported_extensions_cover_registry_without_duplicates() {
+        use super::{find_format, supported_extensions};
+        let exts = supported_extensions();
+        // No drift: every listed ext must resolve back to a real format, and a
+        // few representative formats from distinct modules must be present.
+        for ext in &exts {
+            assert!(find_format(ext).is_some(), "ext senza formato: {ext}");
+        }
+        for expected in ["csv", "png", "svg", "xlsx", "pdf", "md", "obj"] {
+            assert!(exts.contains(&expected), "estensione mancante: {expected}");
+        }
+        // Deduplicated: shared exts across rows are listed once.
+        let mut sorted = exts.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), exts.len(), "estensioni duplicate in {exts:?}");
+    }
 
     #[test]
     fn registry_routes_known_extensions_and_falls_back() {

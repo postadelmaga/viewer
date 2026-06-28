@@ -4,6 +4,7 @@
 // Drag & drop a file onto the window, or press "Apri" / Ctrl+O.
 
 mod app;
+mod clip;
 mod ipc;
 mod ui;
 
@@ -96,6 +97,9 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("viewer")
         .with_decorations(false)
+        // Transparent surface so the frosted toolbar (and rounded edges) let the
+        // desktop show through; on KWin the compositor blurs it for ~free.
+        .with_transparent(true)
         .with_drag_and_drop(true);
     viewport = if quicklook {
         viewport.with_inner_size([900.0, 640.0]).with_always_on_top()
@@ -115,6 +119,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             let _ = WAKE.set(cc.egui_ctx.clone());
+            app::configure_style(&cc.egui_ctx);
 
             // Listen for files sent by later invocations and wake the UI.
             if let Some(listener) = listener {

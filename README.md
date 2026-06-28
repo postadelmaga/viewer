@@ -8,12 +8,13 @@ Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG
 - **Singola istanza + residente**: aprire un altro file riusa la finestra (handoff via socket Unix ~5 ms); in Quick Look il processo resta vivo nascosto, così le riaperture sono istantanee (auto-uscita dopo 5 min di inattività).
 - **Quick Look** (`--quicklook`): finestra overlay sempre in primo piano, si chiude con **Spazio/Esc** o alla perdita di focus. Pensata per essere legata a **Spazio** in Dolphin.
 - GPU-accelerato, binario singolo.
+- **Interfaccia** dark curata (accento, angoli arrotondati) con **finestra trasparente** e **toolbar frosted**: su KWin, con l'effetto *Blur* attivo, diventa vetro smerigliato vero — costo a carico del compositore, ~zero per l'app.
 - CSV/fogli con **rendering virtualizzato**: regge file enormi (mostra solo le righe visibili), colonne ridimensionabili, filtro live.
 - Immagini/SVG con **zoom** (rotella/pinch, ancorato al cursore) e **pan** (trascina). SVG rasterizzato con resvg.
 - **Fogli di calcolo** (`.xlsx .xlsm .xlsb .xls .ods`) via calamine → tabella con selettore di foglio.
 - **Word / PowerPoint / OpenDocument** (`.docx .pptx .odt .odp`) → anteprima testo (estrazione contenuto).
 - **Markdown** (`.md .markdown`) renderizzato (egui_commonmark).
-- **PDF** (`.pdf`) con rendering pagine, zoom/pan e navigazione (◀/▶, frecce, PgUp/PgDn). Richiede `libpdfium.so` (vedi sotto).
+- **PDF** (`.pdf`) con rendering pagine, zoom/pan e navigazione pagine (◀/▶, PgUp/PgDn). Richiede `libpdfium.so` (vedi sotto).
 - **Modelli 3D** (`.obj .gltf .glb`) renderizzati su GPU (OpenGL/glow) con **camera orbitale**: trascina per ruotare, rotella per lo zoom, **Adatta** per inquadrare. Materiali/texture ignorati (solo geometria, illuminazione Lambert a faro). OBJ via **parser multi-thread interno** (~3-4× più veloce su file grandi: il parsing testuale è quasi tutto il costo di un OBJ); glTF 2.0 via `gltf` (scena di default appiattita in world-space). Decodifica **off-thread** con **spinner** di caricamento, così i file grandi non bloccano la finestra. Modulo opzionale: feature `mesh` di `viewer-core` (vedi sotto).
 - Formati binari legacy `.doc/.ppt` non supportati (converti in .docx/.pptx).
 
@@ -37,9 +38,12 @@ cargo build --release
 ```
 
 - Trascina un file nella finestra, oppure premi **📂 Apri** / **Ctrl+O**.
+- **← / →** = file precedente/successivo nella **stessa cartella** (scorre solo i formati supportati, ordine alfabetico, con wrap agli estremi).
+- **Ctrl+C** = copia negli appunti: le **immagini** come immagine (incolli in editor/chat), gli **altri file** come `text/uri-list` (incolli in Dolphin); fallback al percorso come testo. Usa `wl-copy` (Wayland).
 - **F** o **⛶** = schermo intero; **Esc** esce dal fullscreen (o chiude la finestra).
 - Finestra frameless: trascina la **toolbar** per spostarla, doppio-clic per massimizzare.
-- Immagine/PDF/SVG: rotella = zoom, trascina = pan, **Adatta** = reset; il contenuto si adatta automaticamente alla finestra.
+- Immagine/PDF/SVG/3D: rotella = zoom, trascina = pan/ruota, **Adatta** = reset; il contenuto si adatta automaticamente alla finestra.
+- **PDF**: **PgUp/PgDn** o i pulsanti ◀/▶ cambiano pagina (le frecce ← → sono riservate alla navigazione tra file).
 - CSV: scrivi nel box **🔍 filtra** per filtrare le righe.
 
 ### Integrazione col file manager

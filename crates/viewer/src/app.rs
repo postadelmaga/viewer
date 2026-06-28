@@ -48,6 +48,46 @@ pub(crate) struct App {
     pub(crate) pending_load: Option<(PathBuf, Receiver<Decoded>)>,
     /// Whether content_ready has already been reported (for VIEWER_BENCH).
     reported_ready: bool,
+    /// Transient "copied" feedback shown briefly in the toolbar.
+    copy_status: Option<(String, Instant)>,
+}
+
+/// Apply the app's visual theme: a modern dark palette with an accent colour,
+/// rounded widgets, and slightly translucent panel fills. Combined with the
+/// transparent window, the toolbar reads as frosted glass (KWin blurs it when
+/// the Blur effect is on). Purely a paint-style change — no performance cost.
+pub(crate) fn configure_style(ctx: &egui::Context) {
+    use egui::{Color32, Rounding};
+
+    let mut v = egui::Visuals::dark();
+    let accent = Color32::from_rgb(98, 134, 248);
+
+    // Near-opaque so content stays readable; the desktop only barely shows.
+    v.panel_fill = Color32::from_rgba_unmultiplied(24, 25, 31, 246);
+    v.window_fill = Color32::from_rgba_unmultiplied(28, 29, 36, 242);
+    v.extreme_bg_color = Color32::from_rgba_unmultiplied(16, 17, 21, 246);
+    v.window_rounding = Rounding::same(10.0);
+    v.menu_rounding = Rounding::same(8.0);
+    v.selection.bg_fill = accent.gamma_multiply(0.45);
+    v.selection.stroke = egui::Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.rounding = Rounding::same(6.0);
+    }
+    v.widgets.hovered.bg_fill = Color32::from_rgb(48, 50, 60);
+    v.widgets.active.bg_fill = accent.gamma_multiply(0.55);
+    ctx.set_visuals(v);
+
+    let mut s = (*ctx.style()).clone();
+    s.spacing.button_padding = egui::vec2(9.0, 5.0);
+    s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    ctx.set_style(s);
 }
 
 /// Display name for the title bar / toolbar.
@@ -55,6 +95,15 @@ pub(crate) fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+/// Whether `path`'s extension is one of `exts` (case-insensitive). `exts` comes
+/// from [`viewer_core::supported_extensions`], so the open dialog and arrow-key
+/// folder navigation stay in lockstep with the decoder registry.
+fn ext_in(path: &Path, exts: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| exts.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 impl Default for App {
@@ -74,6 +123,7 @@ impl Default for App {
             parallel: false,
             pending_load: None,
             reported_ready: false,
+            copy_status: None,
         }
     }
 }
@@ -152,20 +202,67 @@ impl App {
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
+        let exts = viewer_core::supported_extensions();
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "Supportati",
-                &[
-                    "csv", "tsv", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "svg",
-                    "xlsx", "xlsm", "xlsb", "xls", "ods", "docx", "pptx", "odt", "odp", "pdf",
-                    "md", "markdown", "obj", "gltf", "glb",
-                ],
-            )
+            .add_filter("Supportati", &exts)
             .add_filter("Tutti i file", &["*"])
             .pick_file()
         {
             self.open(ctx, path);
         }
+    }
+
+    /// Step to the previous/next openable file in the current file's folder
+    /// (`delta` = -1 / +1), wrapping at the ends. Files are sorted by name
+    /// (case-insensitive), matching the file manager's usual order.
+    fn navigate_dir(&mut self, ctx: &egui::Context, delta: i32) {
+        let Some(cur) = self.file_path.clone() else {
+            return;
+        };
+        let Some(dir) = cur.parent() else {
+            return;
+        };
+        let exts = viewer_core::supported_extensions();
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file() && ext_in(p, &exts))
+                .collect(),
+            Err(_) => return,
+        };
+        if files.len() < 2 {
+            return; // nothing to step to
+        }
+        files.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+
+        let cur_name = cur.file_name();
+        let here = files.iter().position(|p| p.file_name() == cur_name);
+        let n = files.len() as i32;
+        // Wrap so Left at the first file lands on the last, and vice versa.
+        let next = match here {
+            Some(i) => (((i as i32 + delta) % n) + n) % n,
+            None => 0,
+        } as usize;
+        let target = files[next].clone();
+        if target != cur {
+            self.open(ctx, target);
+        }
+    }
+
+    /// Copy the current file to the clipboard — image data for raster images, the
+    /// file itself (uri-list) otherwise — falling back to the path as text.
+    fn copy_current(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.file_path.clone() else {
+            return;
+        };
+        let msg = match crate::clip::copy_file(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                ctx.copy_text(path.to_string_lossy().to_string());
+                "Percorso copiato".to_string()
+            }
+        };
+        self.copy_status = Some((msg, Instant::now()));
     }
 
     /// Per-content controls shown in the toolbar.
@@ -361,6 +458,11 @@ impl eframe::App for App {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
             self.open_dialog(ctx);
         }
+        // Ctrl+C: copy the file (skip when a text field has focus so its own
+        // selection-copy still works).
+        if !typing && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            self.copy_current(ctx);
+        }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.toggle_fullscreen(ctx);
         }
@@ -371,14 +473,11 @@ impl eframe::App for App {
                 self.dismiss(ctx);
             }
         }
-        // PDF page navigation with arrows / PageUp-Down.
+        // PDF page navigation with PageUp / PageDown (the arrows step through the
+        // folder instead — see below).
         if let Content::Pdf(pdf) = &mut self.content {
-            let next = ctx.input(|i| {
-                i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::PageDown)
-            });
-            let prev = ctx.input(|i| {
-                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::PageUp)
-            });
+            let next = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
+            let prev = ctx.input(|i| i.key_pressed(egui::Key::PageUp));
             if next && pdf.page + 1 < pdf.pages {
                 pdf.page += 1;
             }
@@ -387,7 +486,20 @@ impl eframe::App for App {
             }
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        // Arrow keys: scroll through the openable files in the current folder.
+        if !typing {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                self.navigate_dir(ctx, 1);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                self.navigate_dir(ctx, -1);
+            }
+        }
+
+        // Frosted, more translucent than the content panels so it reads as glass.
+        let bar_frame = egui::Frame::default()
+            .fill(egui::Color32::from_rgba_unmultiplied(28, 29, 36, 205))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+        egui::TopBottomPanel::top("toolbar").frame(bar_frame).show(ctx, |ui| {
             // Frameless window: the toolbar background is a window-drag handle.
             // Register it FIRST so the buttons drawn next sit on top and keep
             // receiving their clicks (egui gives priority to later widgets).
@@ -425,6 +537,14 @@ impl eframe::App for App {
                     ui.separator();
                     if !self.file_name.is_empty() {
                         ui.label(&self.file_name);
+                    }
+                    // Brief "copied" feedback after Ctrl+C.
+                    if let Some((msg, t)) = &self.copy_status {
+                        if t.elapsed() < std::time::Duration::from_secs(2) {
+                            ui.separator();
+                            ui.colored_label(Color32::from_rgb(120, 200, 120), format!("✔ {msg}"));
+                            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                        }
                     }
                 });
             });
@@ -553,6 +673,12 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+
+    /// Transparent clear colour so the panels paint their own (frosted) fills
+    /// over the desktop — the basis for the translucent toolbar / window edges.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     /// Free GPU resources the egui texture manager doesn't own (the 3D mesh's
