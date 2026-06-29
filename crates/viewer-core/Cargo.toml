@@ -2,7 +2,7 @@
 name = "viewer-core"
 version = "0.1.0"
 edition = "2021"
-description = "Fast, UI-agnostic file decoding for CSV/TSV, images, SVG, Office/OpenDocument, Markdown and PDF. Decodes a path into Send-able raw data (RGBA pixels, table rows, text) off the UI thread — no GPU or windowing dependency."
+description = "Fast, UI-agnostic file decoding for CSV/TSV, images, SVG, Office/OpenDocument, Markdown, PDF, 3D meshes (OBJ/glTF/STL) and text/code. Decodes a path into Send-able raw data (RGBA pixels, table rows, text, geometry) off the UI thread — no GPU or windowing dependency."
 license = "MIT OR Apache-2.0"
 
 [features]
@@ -18,7 +18,7 @@ pdf = ["dep:pdfium-render"]
 mesh = ["dep:gltf"]
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "tga", "dds", "hdr", "exr", "pnm", "qoi", "ff"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "tga", "dds", "hdr", "pnm", "qoi", "ff"] }
 # SVG rasterisation only: default-features disabled to drop text shaping
 # (rustybuzz/fontdb/ttf-parser/unicode-*) and embedded-raster codecs
 # (gif/image-webp/zune-jpeg). We render shapes/paths; SVG <text> is not drawn

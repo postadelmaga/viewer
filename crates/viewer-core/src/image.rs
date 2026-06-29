@@ -9,7 +9,7 @@ pub(crate) const FORMATS: &[Format] = &[
     Format {
         exts: &[
             "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "tga", "dds", "hdr",
-            "exr", "pnm", "pbm", "pgm", "ppm", "pam", "qoi", "ff", "farbfeld",
+            "pnm", "pbm", "pgm", "ppm", "pam", "qoi", "ff", "farbfeld",
         ],
         family: Family::Image,
         decode: raster_entry,

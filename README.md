@@ -1,6 +1,6 @@
 # viewer
 
-Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG, GIF, BMP, WebP, TIFF, ICO), **SVG**, **documenti Office**, **PDF** e **modelli 3D** (OBJ, glTF/GLB).
+Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG, GIF, BMP, WebP, TIFF, ICO, TGA, QOI, DDS, HDR, PNM, farbfeld), **SVG**, **documenti Office**, **PDF**, **modelli 3D** (OBJ, glTF/GLB, STL) e **file di testo/codice**.
 
 - Avvio istantaneo (~65 ms al primo frame, backend OpenGL/glow — misurato 3× più veloce di Vulkan/wgpu su questo carico).
 - **Pipeline parallela** (default): il file viene decodificato su un thread mentre il thread principale inizializza la finestra → la UI è interattiva in ~90 ms **a prescindere dalla dimensione del file** (un CSV da 45 MB mostra la finestra a ~120 ms invece di ~900 ms). `VIEWER_PIPELINE=sync` forza la vecchia decodifica inline.
@@ -10,12 +10,13 @@ Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG
 - GPU-accelerato, binario singolo.
 - **Interfaccia** dark curata (accento, angoli arrotondati) con **finestra trasparente** e **toolbar frosted**: su KWin, con l'effetto *Blur* attivo, diventa vetro smerigliato vero — costo a carico del compositore, ~zero per l'app.
 - CSV/fogli con **rendering virtualizzato**: regge file enormi (mostra solo le righe visibili), colonne ridimensionabili, filtro live.
-- Immagini/SVG con **zoom** (rotella/pinch, ancorato al cursore) e **pan** (trascina). SVG rasterizzato con resvg.
+- Immagini/SVG con **zoom** (rotella/pinch, ancorato al cursore) e **pan** (trascina). SVG rasterizzato con resvg in modalità **solo forme/path**: il testo `<text>` e i bitmap incorporati non vengono resi (lo stack di shaping testo e font di sistema è compilato fuori per tenere il binario leggero; riattivabile dalle feature di `resvg` in `viewer-core`).
 - **Fogli di calcolo** (`.xlsx .xlsm .xlsb .xls .ods`) via calamine → tabella con selettore di foglio.
 - **Word / PowerPoint / OpenDocument** (`.docx .pptx .odt .odp`) → anteprima testo (estrazione contenuto).
 - **Markdown** (`.md .markdown`) renderizzato (egui_commonmark).
+- **Testo e codice** (`.txt .log .json .yaml .toml .xml .html .css .sql`, sorgenti `.rs .py .js .ts .c .cpp .go .rb .sh …` e molti altri) → mostrati in un editor di sola lettura. Registrarli esplicitamente li rende cittadini di prima classe: budget di memoria «testo», presenti nel dialog di apertura e raggiungibili dalla navigazione ← / →.
 - **PDF** (`.pdf`) con rendering pagine, zoom/pan e navigazione pagine (◀/▶, PgUp/PgDn). Richiede `libpdfium.so` (vedi sotto).
-- **Modelli 3D** (`.obj .gltf .glb`) renderizzati su GPU (OpenGL/glow) con **camera orbitale**: trascina per ruotare, rotella per lo zoom, **Adatta** per inquadrare. Materiali/texture ignorati (solo geometria, illuminazione Lambert a faro). OBJ via **parser multi-thread interno** (~3-4× più veloce su file grandi: il parsing testuale è quasi tutto il costo di un OBJ); glTF 2.0 via `gltf` (scena di default appiattita in world-space). Decodifica **off-thread** con **spinner** di caricamento, così i file grandi non bloccano la finestra. Modulo opzionale: feature `mesh` di `viewer-core` (vedi sotto).
+- **Modelli 3D** (`.obj .gltf .glb .stl`) renderizzati su GPU (OpenGL/glow) con **camera orbitale**: trascina per ruotare, rotella per lo zoom, **Adatta** per inquadrare. Materiali/texture ignorati (solo geometria, illuminazione Lambert a faro). OBJ via **parser multi-thread interno** (~3-4× più veloce su file grandi: il parsing testuale è quasi tutto il costo di un OBJ); glTF 2.0 via `gltf` (scena di default appiattita in world-space); STL **binario e ASCII** (normali ricavate dalla geometria → flat shading corretto). Decodifica **off-thread** con **spinner** di caricamento, così i file grandi non bloccano la finestra. Modulo opzionale: feature `mesh` di `viewer-core` (vedi sotto).
 - Formati binari legacy `.doc/.ppt` non supportati (converti in .docx/.pptx).
 
 ## Dipendenza per il PDF
@@ -68,17 +69,18 @@ Il dispatch non è un `match` centrale che cresce a ogni formato: ogni modulo de
 ```rust
 pub struct Format {
     pub exts: &'static [&'static str], // estensioni rivendicate
-    pub family: Family,                // budget di memoria (Text/Image/Other)
+    pub family: Family,                // budget di memoria (Text/Image/Mesh/Other)
     pub decode: fn(Input) -> Decoded,  // Input { path, bytes }
 }
 // es. nel modulo mesh:
 pub(crate) const FORMATS: &[Format] = &[
-    Format { exts: &["obj"],          family: Family::Other, decode: obj_entry },
-    Format { exts: &["gltf", "glb"],  family: Family::Other, decode: gltf_entry },
+    Format { exts: &["obj"],          family: Family::Mesh, decode: obj_entry },
+    Format { exts: &["gltf", "glb"],  family: Family::Mesh, decode: gltf_entry },
+    Format { exts: &["stl"],          family: Family::Mesh, decode: stl_entry },
 ];
 ```
 
-Aggiungere un formato = **un modulo nuovo + una riga** (più la sua `#[cfg(feature = …)]` se opzionale); il core `decode()` non si tocca. Il flusso resta **performante**: si risolve il formato dall'estensione → si applica il size-guard per `Family` *prima* di leggere il file → si legge una sola volta e si passa per valore al decoder (es. il PDF inoltra il buffer senza copiarlo). I formati gated (3D) registrano comunque le loro estensioni: senza la feature vengono *riconosciute* ma decodificano in un errore «non compilato», anziché cadere nel fallback testo.
+Aggiungere un formato = **un modulo nuovo + una riga** (più la sua `#[cfg(feature = …)]` se opzionale); il core `decode()` non si tocca. La lista delle estensioni non viene mai ricopiata a mano: `viewer_core::supported_extensions()` la deriva dal registro, ed è da lì che l'app costruisce il filtro del dialog «Apri» e la navigazione ← / → — così non possono divergere da ciò che è davvero decodificabile. Il flusso resta **performante**: si risolve il formato dall'estensione → si applica il size-guard per `Family` *prima* di leggere il file → si legge una sola volta e si passa per valore al decoder (es. il PDF inoltra il buffer senza copiarlo). I formati gated (3D) registrano comunque le loro estensioni: senza la feature vengono *riconosciute* ma decodificano in un errore «non compilato», anziché cadere nel fallback testo.
 
 Esempio minimo (qualsiasi app Rust):
 ```rust
