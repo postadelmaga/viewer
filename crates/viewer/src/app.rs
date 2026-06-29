@@ -583,10 +583,12 @@ impl eframe::App for App {
             if !typing && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
                 view.toggle_play();
             }
+            // ← / → seek ±5s; hold Shift for ±10s.
+            let step = if ctx.input(|i| i.modifiers.shift) { 10.0 } else { 5.0 };
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                view.seek_by(5.0);
+                view.seek_by(step);
             } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-                view.seek_by(-5.0);
+                view.seek_by(-step);
             }
         } else if !typing {
             // Arrow keys: scroll through the openable files in the current folder.
@@ -754,6 +756,14 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // A double-click on the video asks for fullscreen; apply it here where
+        // the app owns that state (keeps F / Esc in sync).
+        if let Content::Media(view) = &mut self.content {
+            if std::mem::take(&mut view.pending_fullscreen) {
+                self.toggle_fullscreen(ctx);
+            }
+        }
 
         // Benchmark checkpoints (VIEWER_BENCH): window shown, then content ready.
         if self.first_frame {
