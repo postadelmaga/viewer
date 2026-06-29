@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 /// it's vector source, not a w·h·4 raster — while rasters use the image budget.
 pub(crate) const FORMATS: &[Format] = &[
     Format {
-        exts: &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico"],
+        exts: &[
+            "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "tga", "dds", "hdr",
+            "exr", "pnm", "pbm", "pgm", "ppm", "pam", "qoi", "ff", "farbfeld",
+        ],
         family: Family::Image,
         decode: raster_entry,
     },
@@ -20,7 +23,14 @@ pub(crate) const FORMATS: &[Format] = &[
 ];
 
 fn raster_entry(input: Input) -> Decoded {
-    decode_image(&input.bytes)
+    // Pass the extension so formats with no magic signature (notably TGA) still
+    // decode when content-sniffing can't identify them.
+    let ext = input
+        .path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    decode_image_ext(&input.bytes, &ext)
 }
 
 fn svg_entry(input: Input) -> Decoded {
@@ -35,13 +45,31 @@ const MAX_PIXELS: u64 = 60_000_000; // 60 MP target after downscale
 /// RGBA peak). Beyond this we refuse with a clear message instead of OOMing.
 const MAX_DECODE_PIXELS: u64 = 100_000_000;
 
+/// Decode raster bytes whose format is sniffed from content. Use when the
+/// extension is unknown (e.g. the extension-less fallback path).
 pub fn decode_image(bytes: &[u8]) -> Decoded {
+    decode_image_ext(bytes, "")
+}
+
+/// Like [`decode_image`], but with the file extension as a fallback format hint
+/// for formats that carry no magic signature (TGA above all). Content sniffing
+/// still wins when it succeeds; `ext` only fills the gap when it doesn't.
+pub fn decode_image_ext(bytes: &[u8], ext: &str) -> Decoded {
+    // A reader with the format resolved by content, then by extension. Built
+    // twice (dimension probe, then decode) since `ImageReader` isn't reusable.
+    let reader = || -> Option<image::ImageReader<Cursor<&[u8]>>> {
+        let mut r = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        if r.format().is_none() {
+            r.set_format(image::ImageFormat::from_extension(ext)?);
+        }
+        Some(r)
+    };
+
     // Probe dimensions from the header (cheap, no pixel decode) and refuse
     // anything past the decode ceiling with a precise message.
-    let dims = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|r| r.into_dimensions().ok());
+    let dims = reader().and_then(|r| r.into_dimensions().ok());
     if let Some((w, h)) = dims {
         if w as u64 * h as u64 > MAX_DECODE_PIXELS {
             return Decoded::Error(format!(
@@ -56,9 +84,9 @@ pub fn decode_image(bytes: &[u8]) -> Decoded {
     // limit would reject large-but-acceptable images before we can downscale).
     // ~8 bytes/px covers the RGBA buffer plus typical decoder scratch; bounded
     // because the dimension probe above already rejects anything > the ceiling.
-    let mut reader = match image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() {
-        Ok(r) => r,
-        Err(e) => return Decoded::Error(format!("Immagine non leggibile:\n{e}")),
+    let mut reader = match reader() {
+        Some(r) => r,
+        None => return Decoded::Error("Immagine non leggibile".into()),
     };
     let px = dims.map(|(w, h)| w as u64 * h as u64).unwrap_or(MAX_DECODE_PIXELS);
     let mut limits = image::Limits::default();

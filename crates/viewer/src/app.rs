@@ -571,7 +571,7 @@ impl eframe::App for App {
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            "Trascina qui un file: CSV, immagine, SVG, Excel/Word/PowerPoint, PDF, 3D (OBJ/glTF)\n(oppure premi Apri / Ctrl+O)",
+                            "Trascina qui un file: CSV, immagine, SVG, Excel/Word/PowerPoint, PDF, 3D (OBJ/glTF/STL), testo/codice\n(oppure premi Apri / Ctrl+O)",
                         );
                     });
                 }

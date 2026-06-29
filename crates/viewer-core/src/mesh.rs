@@ -27,6 +27,11 @@ pub(crate) const FORMATS: &[Format] = &[
         family: Family::Mesh,
         decode: gltf_entry,
     },
+    Format {
+        exts: &["stl"],
+        family: Family::Mesh,
+        decode: stl_entry,
+    },
 ];
 
 #[cfg(feature = "mesh")]
@@ -37,6 +42,10 @@ fn obj_entry(input: Input) -> Decoded {
 fn gltf_entry(input: Input) -> Decoded {
     decode_gltf(&input.path)
 }
+#[cfg(feature = "mesh")]
+fn stl_entry(input: Input) -> Decoded {
+    decode_stl(&input.bytes)
+}
 
 #[cfg(not(feature = "mesh"))]
 fn obj_entry(_: Input) -> Decoded {
@@ -44,6 +53,10 @@ fn obj_entry(_: Input) -> Decoded {
 }
 #[cfg(not(feature = "mesh"))]
 fn gltf_entry(_: Input) -> Decoded {
+    not_compiled()
+}
+#[cfg(not(feature = "mesh"))]
+fn stl_entry(_: Input) -> Decoded {
     not_compiled()
 }
 #[cfg(not(feature = "mesh"))]
@@ -207,6 +220,85 @@ pub fn decode_obj(bytes: &[u8]) -> Decoded {
     }
     let kind = format!("OBJ · {}", tri_label(indices.len() / 3));
     MeshData::build(positions, normals, indices, kind)
+}
+
+/// Decode an STL (binary or ASCII) into geometry. STL stores each triangle's
+/// three corner positions outright with no vertex sharing, so we emit them as a
+/// flat position list with sequential indices and let [`MeshData::build`]
+/// synthesise normals — each corner belongs to exactly one face, so the computed
+/// normal is that face's normal: correct flat shading without trusting the
+/// (often-zero) normals STL files carry.
+#[cfg(feature = "mesh")]
+pub fn decode_stl(bytes: &[u8]) -> Decoded {
+    let t = std::time::Instant::now();
+    let positions = if is_binary_stl(bytes) {
+        parse_binary_stl(bytes)
+    } else {
+        parse_ascii_stl(bytes)
+    };
+    mesh_bench("stl_parse", t.elapsed());
+
+    match positions {
+        Some(pos) if pos.len() >= 3 => {
+            let indices: Vec<u32> = (0..pos.len() as u32).collect();
+            let kind = format!("STL · {}", tri_label(pos.len() / 3));
+            MeshData::build(pos, None, indices, kind)
+        }
+        _ => Decoded::Error("STL senza geometria triangolare.".into()),
+    }
+}
+
+/// Binary STL has an 80-byte header, a `u32` triangle count, then exactly 50
+/// bytes per triangle. We detect it by that exact size identity rather than the
+/// header text, since a binary file's header can itself start with `"solid"`.
+#[cfg(feature = "mesh")]
+fn is_binary_stl(bytes: &[u8]) -> bool {
+    if bytes.len() < 84 {
+        return false;
+    }
+    let count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+    84 + count.saturating_mul(50) == bytes.len()
+}
+
+/// Read corner positions from a binary STL, skipping each triangle's face normal.
+#[cfg(feature = "mesh")]
+fn parse_binary_stl(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
+    let count = u32::from_le_bytes(bytes[80..84].try_into().ok()?) as usize;
+    let mut pos = Vec::with_capacity(count * 3);
+    let f = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    for i in 0..count {
+        let tri = 84 + i * 50;
+        if tri + 50 > bytes.len() {
+            break;
+        }
+        // Layout: normal[12] then v0[12] v1[12] v2[12] then attr[2]. Skip normal.
+        for v in 0..3 {
+            let p = tri + 12 + v * 12;
+            pos.push([f(&bytes[p..]), f(&bytes[p + 4..]), f(&bytes[p + 8..])]);
+        }
+    }
+    Some(pos)
+}
+
+/// Read corner positions from an ASCII STL: every `vertex x y z` line, in order.
+/// Malformed vertex lines are skipped so one bad line doesn't sink the file.
+#[cfg(feature = "mesh")]
+fn parse_ascii_stl(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let mut pos = Vec::new();
+    for line in s.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("vertex") {
+            let mut it = rest.split_ascii_whitespace();
+            if let (Some(Ok(x)), Some(Ok(y)), Some(Ok(z))) = (
+                it.next().map(str::parse),
+                it.next().map(str::parse),
+                it.next().map(str::parse),
+            ) {
+                pos.push([x, y, z]);
+            }
+        }
+    }
+    Some(pos)
 }
 
 /// Split `bytes` into at most `n` line-aligned `[start, end)` ranges (each range
@@ -618,6 +710,54 @@ f 1 3 4
                 assert!(m.kind.contains("tri"), "kind: {}", m.kind);
             }
             other => panic!("atteso Mesh, ottenuto {other:?}", other = variant(&other)),
+        }
+    }
+
+    #[test]
+    fn stl_ascii_and_binary_decode_the_same_triangle() {
+        // One triangle in the z=0 plane; its normal should resolve to ±Z.
+        let ascii = "\
+solid t
+  facet normal 0 0 1
+    outer loop
+      vertex 0 0 0
+      vertex 1 0 0
+      vertex 0 1 0
+    endloop
+  endfacet
+endsolid t
+";
+        // Equivalent binary STL: 80-byte header, count=1, then the 50-byte facet.
+        let mut bin = vec![0u8; 84];
+        bin[80] = 1; // little-endian triangle count = 1
+        let push = |b: &mut Vec<u8>, v: [f32; 3]| {
+            for c in v {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        };
+        push(&mut bin, [0.0, 0.0, 1.0]); // normal (ignored by the decoder)
+        push(&mut bin, [0.0, 0.0, 0.0]);
+        push(&mut bin, [1.0, 0.0, 0.0]);
+        push(&mut bin, [0.0, 1.0, 0.0]);
+        bin.extend_from_slice(&[0u8, 0u8]); // attribute byte count
+
+        assert!(!is_binary_stl(ascii.as_bytes()), "ASCII non deve sembrare binario");
+        assert!(is_binary_stl(&bin), "binario riconosciuto per dimensione");
+
+        for (label, bytes) in [("ascii", ascii.as_bytes()), ("binary", bin.as_slice())] {
+            match decode_stl(bytes) {
+                Decoded::Mesh(m) => {
+                    assert_eq!(m.indices.len(), 3, "{label}: un triangolo");
+                    assert_eq!(m.vertices.len(), 3 * 6, "{label}: 3 corner pos+normale");
+                    assert_eq!(m.aabb_min, [0.0, 0.0, 0.0], "{label}");
+                    assert_eq!(m.aabb_max, [1.0, 1.0, 0.0], "{label}");
+                    for v in m.vertices.chunks_exact(6) {
+                        assert!(v[5].abs() > 0.99, "{label}: normale lungo Z: {:?}", &v[3..6]);
+                    }
+                    assert!(m.kind.starts_with("STL"), "{label}: kind {}", m.kind);
+                }
+                other => panic!("{label}: atteso Mesh, ottenuto {}", variant(&other)),
+            }
         }
     }
 

@@ -22,6 +22,7 @@ pub mod mesh;
 pub mod office;
 #[cfg(feature = "pdf")]
 pub mod pdf;
+pub mod text;
 
 pub use csv::CsvData;
 pub use mesh::MeshData;
@@ -126,6 +127,7 @@ fn registry() -> impl Iterator<Item = &'static Format> {
         .chain(image::FORMATS)
         .chain(office::FORMATS)
         .chain(mesh::FORMATS)
+        .chain(text::FORMATS)
 }
 
 /// Find the format claiming `ext` (already lowercased), if any.
