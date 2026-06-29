@@ -1,6 +1,6 @@
 # viewer
 
-Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG, GIF, BMP, WebP, TIFF, ICO, TGA, QOI, DDS, HDR, PNM, farbfeld), **SVG**, **documenti Office**, **PDF**, **modelli 3D** (OBJ, glTF/GLB, STL) e **file di testo/codice**.
+Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG, GIF, BMP, WebP, TIFF, ICO, TGA, QOI, DDS, HDR, PNM, farbfeld), **SVG**, **documenti Office**, **PDF**, **modelli 3D** (OBJ, glTF/GLB, STL), **audio/video** (via FFmpeg), **MIDI** e **file di testo/codice**.
 
 - Avvio istantaneo (~65 ms al primo frame, backend OpenGL/glow — misurato 3× più veloce di Vulkan/wgpu su questo carico).
 - **Pipeline parallela** (default): il file viene decodificato su un thread mentre il thread principale inizializza la finestra → la UI è interattiva in ~90 ms **a prescindere dalla dimensione del file** (un CSV da 45 MB mostra la finestra a ~120 ms invece di ~900 ms). `VIEWER_PIPELINE=sync` forza la vecchia decodifica inline.
@@ -17,9 +17,13 @@ Viewer nativo velocissimo (Rust + egui) per **CSV/TSV**, **immagini** (PNG, JPEG
 - **Testo e codice** (`.txt .log .json .yaml .toml .xml .html .css .sql`, sorgenti `.rs .py .js .ts .c .cpp .go .rb .sh …` e molti altri) → mostrati in un editor di sola lettura. Registrarli esplicitamente li rende cittadini di prima classe: budget di memoria «testo», presenti nel dialog di apertura e raggiungibili dalla navigazione ← / →.
 - **PDF** (`.pdf`) con rendering pagine, zoom/pan e navigazione pagine (◀/▶, PgUp/PgDn). Richiede `libpdfium.so` (vedi sotto).
 - **Modelli 3D** (`.obj .gltf .glb .stl`) renderizzati su GPU (OpenGL/glow) con **camera orbitale**: trascina per ruotare, rotella per lo zoom, **Adatta** per inquadrare. Materiali/texture ignorati (solo geometria, illuminazione Lambert a faro). OBJ via **parser multi-thread interno** (~3-4× più veloce su file grandi: il parsing testuale è quasi tutto il costo di un OBJ); glTF 2.0 via `gltf` (scena di default appiattita in world-space); STL **binario e ASCII** (normali ricavate dalla geometria → flat shading corretto). Decodifica **off-thread** con **spinner** di caricamento, così i file grandi non bloccano la finestra. Modulo opzionale: feature `mesh` di `viewer-core` (vedi sotto).
+- **Audio/Video** (`.mp4 .mkv .webm .mov .avi …`, `.mp3 .flac .wav .ogg .opus …`) via **FFmpeg**: riproduzione *streaming* (il file non viene mai letto tutto in RAM), uscita audio **cpal**, frame video sincronizzati al clock audio, transport con play/pausa e **seek** (Spazio = play/pausa, ← / → = ±5 s). I frame viaggiano sul *data plane* `micro-media` (canale latest-wins, `Arc`-backed: una UI lenta scarta i frame vecchi invece di accodare megabyte). Modulo opzionale: feature `media`; richiede le librerie `libav*` di sistema (vedi sotto).
+- **MIDI** (`.mid .midi`) sintetizzato con **rustysynth** (puro Rust) + un SoundFont: riusa lo stesso player/transport dell'audio. Modulo opzionale: feature `midi`; il SoundFont è un file a runtime, scaricato in background al primo avvio (vedi sotto).
 - Formati binari legacy `.doc/.ppt` non supportati (converti in .docx/.pptx).
 
-## Dipendenza per il PDF
+## Dipendenze runtime
+
+### PDF
 
 Il rendering PDF usa **pdfium**. Metti `libpdfium.so` in uno di questi percorsi (cercati in ordine):
 `$PDFIUM_LIB` · accanto al binario · `~/.local/lib/libpdfium.so` · `/usr/lib` · `/usr/local/lib`.
@@ -30,6 +34,14 @@ curl -fsSL https://github.com/bblanchon/pdfium-binaries/releases/latest/download
   | tar -xz -C /tmp && mkdir -p ~/.local/lib && cp /tmp/lib/libpdfium.so ~/.local/lib/
 ```
 Oppure da AUR: `paru -S pdfium-binaries`.
+
+### Audio/Video (FFmpeg)
+
+La feature `media` lega le librerie `libav*` (libavcodec/format/util/swscale/swresample) **al build-time** e a runtime. Su Arch: `pacman -S ffmpeg`; su Debian/Ubuntu: `apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev`.
+
+### MIDI (SoundFont)
+
+La riproduzione MIDI ha bisogno di un SoundFont `.sf2`. Al primo avvio viene scaricato in background (best-effort, via `curl`/`wget`) in `~/.local/share/viewer/soundfont.sf2`. Per usarne uno tuo: `VIEWER_SOUNDFONT=/percorso/al/banco.sf2`. Per cambiare l'URL di default: `VIEWER_SOUNDFONT_URL=…`.
 
 ## Uso
 

@@ -7,8 +7,7 @@
 
 use eframe::egui;
 use egui::{Color32, TextureHandle, TextureOptions, Vec2};
-use micro_media::LatestReceiver;
-use micro_media::Frame;
+use micro_media::{Frame, LatestReceiver, PixelFormat};
 use std::sync::mpsc::{Receiver, Sender};
 use viewer_core::media::{MediaCmd, MediaMsg};
 use viewer_core::MediaInfo;
@@ -88,10 +87,21 @@ impl MediaView {
         // Data plane: the channel is latest-wins, so this loop sees at most the one
         // freshest frame the worker decoded since the last paint — never a backlog.
         while let Ok(Some(frame)) = self.frame_rx.try_recv() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.pixels,
-            );
+            let size = [frame.width as usize, frame.height as usize];
+            // Honour the frame's declared layout. The engine emits Rgba8 today,
+            // but Bgra8 (common GPU swapchain order) would otherwise paint with
+            // red/blue swapped, so convert it instead of assuming RGBA.
+            let image = match frame.format {
+                PixelFormat::Rgba8 => egui::ColorImage::from_rgba_unmultiplied(size, &frame.pixels),
+                PixelFormat::Bgra8 => {
+                    let pixels = frame
+                        .pixels
+                        .chunks_exact(4)
+                        .map(|p| Color32::from_rgba_unmultiplied(p[2], p[1], p[0], p[3]))
+                        .collect();
+                    egui::ColorImage { size, pixels }
+                }
+            };
             self.tex_size = Vec2::new(frame.width as f32, frame.height as f32);
             match &mut self.texture {
                 Some(tex) => tex.set(image, TextureOptions::LINEAR),

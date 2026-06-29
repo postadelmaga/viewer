@@ -1,0 +1,17 @@
+# micro-media — the data plane for high-bandwidth media payloads.
+#
+# Vendored into this workspace so `viewer` builds self-contained: typed,
+# zero-copy producer→consumer channels that move ownership of big buffers
+# (Arc-backed frames/audio blocks) with no serialization. The video sink uses
+# the latest-wins mailbox so a momentary UI stall drops stale frames instead of
+# queueing megabytes of pixels.
+[package]
+name = "micro-media"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Zero-copy media data plane: latest-wins and bounded channels moving Arc-backed frames/audio blocks by ownership."
+
+[lib]
+name = "micro_media"
+path = "src/lib.rs"

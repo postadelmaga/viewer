@@ -48,4 +48,4 @@ cpal = { version = "0.15", optional = true }
 rustysynth = { version = "1.3", optional = true }
 # Zero-copy media data plane (latest-wins frame channel + Arc-backed Frame type),
 # borrowed from the sibling `Micro` micro-kernel. Std-only, no bus/runtime pulled in.
-micro-media = { path = "../../../Micro/crates/micro-media", optional = true }
+micro-media = { path = "../micro-media", optional = true }

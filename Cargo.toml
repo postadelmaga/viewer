@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/viewer-core", "crates/viewer"]
+members = ["crates/viewer-core", "crates/viewer", "crates/micro-media"]
 
 # Release profile lives at the workspace root so it applies to every member
 # (the binary and the library). Tuned for fast startup and a small binary.

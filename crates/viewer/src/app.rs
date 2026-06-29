@@ -55,6 +55,9 @@ pub(crate) struct App {
     reported_ready: bool,
     /// Transient "copied" feedback shown briefly in the toolbar.
     copy_status: Option<(String, Instant)>,
+    /// The glow context, captured once so a replaced mesh's GPU buffers can be
+    /// freed while the context is still current (fixes a file-switch leak).
+    gl: Option<std::sync::Arc<eframe::glow::Context>>,
 }
 
 /// Apply the app's visual theme: a modern dark palette with an accent colour,
@@ -142,6 +145,7 @@ impl Default for App {
             pending_load: None,
             reported_ready: false,
             copy_status: None,
+            gl: None,
         }
     }
 }
@@ -203,7 +207,7 @@ impl App {
     fn begin_load(&mut self, path: PathBuf) {
         self.file_name = file_label(&path);
         self.file_path = Some(path.clone());
-        self.content = Content::Empty;
+        self.set_content(Content::Empty);
         let rx = spawn_decode(path.clone(), wake_ui);
         self.pending_load = Some((path, rx));
     }
@@ -216,7 +220,16 @@ impl App {
             "viewer — {}",
             self.file_name
         )));
-        self.content = build_content(ctx, decoded, path);
+        self.set_content(build_content(ctx, decoded, path));
+    }
+
+    /// Replace the shown content, first releasing a previous mesh's GPU buffers
+    /// while the glow context is live (dropping the renderer can't free them).
+    fn set_content(&mut self, new: Content) {
+        if let (Content::Mesh(view), Some(gl)) = (&self.content, &self.gl) {
+            view.destroy(gl);
+        }
+        self.content = new;
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -456,6 +469,11 @@ fn content_displayable(c: &Content) -> bool {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let is_first = self.first_frame;
+        // Capture the glow context once so set_content() can free a replaced
+        // mesh's GPU buffers while the context is still current.
+        if self.gl.is_none() {
+            self.gl = frame.gl().cloned();
+        }
 
         // Files handed over by later invocations (single instance).
         let mut incoming: Option<PathBuf> = None;
