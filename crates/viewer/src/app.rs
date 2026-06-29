@@ -4,6 +4,7 @@ use crate::ui::image_view::{image_view, ImageView};
 use crate::ui::mesh_view::{mesh_view, MeshView};
 use crate::ui::pdf_view::{prepare_pdf, PdfView};
 use crate::ui::table::{csv_table, csv_toolbar, CsvView, SheetView};
+use crate::ui::text_view::{text_view, TextView};
 use crate::{bench, wake_ui};
 use eframe::egui;
 use egui::{Color32, TextureOptions, Vec2};
@@ -22,7 +23,7 @@ pub(crate) enum Content {
     Markdown(String),
     Pdf(PdfView),
     Mesh(MeshView),
-    Text(String),
+    Text(TextView),
     Error(String),
 }
 
@@ -87,6 +88,19 @@ pub(crate) fn configure_style(ctx: &egui::Context) {
     let mut s = (*ctx.style()).clone();
     s.spacing.button_padding = egui::vec2(9.0, 5.0);
     s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+
+    // Explicit type scale: slightly larger and airier than egui's defaults, so
+    // body text, tables, toolbar and code read consistently across the app.
+    use egui::{FontFamily, FontId, TextStyle};
+    s.text_styles = [
+        (TextStyle::Small, FontId::new(10.5, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(19.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+    ]
+    .into();
+
     ctx.set_style(s);
 }
 
@@ -198,7 +212,12 @@ impl App {
             "viewer — {}",
             self.file_name
         )));
-        self.content = build_content(ctx, decoded);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        self.content = build_content(ctx, decoded, &ext);
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -303,6 +322,27 @@ impl App {
                 }
                 ui.label("trascina = ruota · rotella = zoom");
             }
+            Content::Text(view) => {
+                if ui.button("➖").clicked() {
+                    view.zoom_out();
+                }
+                ui.label(format!("{:.0}%", view.zoom_pct()));
+                if ui.button("➕").clicked() {
+                    view.zoom_in();
+                }
+                if ui.button("Adatta").clicked() {
+                    view.zoom_reset();
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(view.wrap(), "a-capo")
+                    .on_hover_text("Manda a capo le righe lunghe")
+                    .clicked()
+                {
+                    view.toggle_wrap();
+                }
+                ui.label("Ctrl+rotella = zoom");
+            }
             Content::Pdf(pdf) => {
                 if ui.button("◀").clicked() && pdf.page > 0 {
                     pdf.page -= 1;
@@ -332,12 +372,12 @@ impl App {
 }
 
 /// Build the live `Content` from a decode result, creating GPU textures.
-fn build_content(ctx: &egui::Context, decoded: Decoded) -> Content {
+fn build_content(ctx: &egui::Context, decoded: Decoded, ext: &str) -> Content {
     match decoded {
         Decoded::Csv(c) => Content::Csv(CsvView::new(c)),
         Decoded::Sheets(s) => Content::Sheets(SheetView::new(s)),
         Decoded::Markdown(s) => Content::Markdown(s),
-        Decoded::Text(s) => Content::Text(s),
+        Decoded::Text(s) => Content::Text(TextView::new(s, ext.to_string())),
         Decoded::Pdf(bytes) => Content::Pdf(prepare_pdf(bytes)),
         Decoded::Mesh(m) => Content::Mesh(MeshView::new(m)),
         Decoded::Error(e) => Content::Error(e),
@@ -581,16 +621,7 @@ impl eframe::App for App {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), e.clone());
                 });
             }
-            Content::Text(s) => {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    let mut text = s.as_str();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .code_editor()
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-            }
+            Content::Text(view) => text_view(ui, view),
             Content::Csv(data) => csv_table(ui, data),
             Content::Sheets(sd) => csv_table(ui, &sd.sheets[sd.current].1),
             Content::Image(view) => image_view(ui, view),
