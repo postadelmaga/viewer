@@ -1,6 +1,7 @@
 //! Application state and the egui update loop.
 
 use crate::ui::image_view::{image_view, ImageView};
+use crate::ui::media_view::{media_toolbar, media_view, MediaView};
 use crate::ui::mesh_view::{mesh_view, MeshView};
 use crate::ui::pdf_view::{prepare_pdf, PdfView};
 use crate::ui::table::{csv_table, csv_toolbar, CsvView, SheetView};
@@ -11,6 +12,8 @@ use egui::{Color32, TextureOptions, Vec2};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
+use viewer_core::media::media_worker;
+use viewer_core::midi::midi_worker;
 use viewer_core::pdf::{pdf_worker, PdfMsg, PdfReq};
 use viewer_core::{decode, spawn_decode, Decoded};
 
@@ -24,6 +27,7 @@ pub(crate) enum Content {
     Pdf(PdfView),
     Mesh(MeshView),
     Text(TextView),
+    Media(MediaView),
     Error(String),
 }
 
@@ -212,12 +216,7 @@ impl App {
             "viewer — {}",
             self.file_name
         )));
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_lowercase();
-        self.content = build_content(ctx, decoded, &ext);
+        self.content = build_content(ctx, decoded, path);
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -343,6 +342,7 @@ impl App {
                 }
                 ui.label("Ctrl+rotella = zoom");
             }
+            Content::Media(view) => media_toolbar(ui, view),
             Content::Pdf(pdf) => {
                 if ui.button("◀").clicked() && pdf.page > 0 {
                     pdf.page -= 1;
@@ -372,14 +372,43 @@ impl App {
 }
 
 /// Build the live `Content` from a decode result, creating GPU textures.
-fn build_content(ctx: &egui::Context, decoded: Decoded, ext: &str) -> Content {
+fn build_content(ctx: &egui::Context, decoded: Decoded, path: &Path) -> Content {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
     match decoded {
         Decoded::Csv(c) => Content::Csv(CsvView::new(c)),
         Decoded::Sheets(s) => Content::Sheets(SheetView::new(s)),
         Decoded::Markdown(s) => Content::Markdown(s),
-        Decoded::Text(s) => Content::Text(TextView::new(s, ext.to_string())),
+        Decoded::Text(s) => Content::Text(TextView::new(s, ext)),
         Decoded::Pdf(bytes) => Content::Pdf(prepare_pdf(bytes)),
         Decoded::Mesh(m) => Content::Mesh(MeshView::new(m)),
+        Decoded::Media(info) => {
+            // Spawn the playback worker streaming from the path; it wakes the UI
+            // when a frame or status arrives. The view owns the control channel.
+            // MIDI is synthesised (rustysynth + SoundFont); everything else is
+            // demuxed/decoded by FFmpeg. Both speak the same MediaCmd/MediaMsg.
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+            let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+            // Data plane for decoded video frames (latest-wins, Arc-backed). For MIDI
+            // (audio-only) the sender is simply dropped, closing the empty channel.
+            let (frame_tx, frame_rx) = micro_media::latest::<micro_media::Frame>();
+            let ctx2 = ctx.clone();
+            let p = path.to_path_buf();
+            let is_midi = matches!(ext.as_str(), "mid" | "midi");
+            std::thread::spawn(move || {
+                let wake = move || ctx2.request_repaint();
+                if is_midi {
+                    drop(frame_tx);
+                    midi_worker(p, cmd_rx, msg_tx, wake)
+                } else {
+                    media_worker(p, cmd_rx, msg_tx, frame_tx, wake)
+                }
+            });
+            Content::Media(MediaView::new(info, cmd_tx, msg_rx, frame_rx))
+        }
         Decoded::Error(e) => Content::Error(e),
         Decoded::Image {
             rgba,
@@ -470,8 +499,12 @@ impl eframe::App for App {
             if focused {
                 self.ever_focused = true;
             }
+            // Space toggles playback for media; only dismiss with it otherwise.
+            let is_media = matches!(self.content, Content::Media(_));
             let space = ctx.input(|i| i.key_pressed(egui::Key::Space));
-            if (space && !ctx.wants_keyboard_input()) || (self.ever_focused && !focused) {
+            if (space && !is_media && !ctx.wants_keyboard_input())
+                || (self.ever_focused && !focused)
+            {
                 self.dismiss(ctx);
             }
         }
@@ -526,8 +559,19 @@ impl eframe::App for App {
             }
         }
 
-        // Arrow keys: scroll through the openable files in the current folder.
-        if !typing {
+        // Media transport keys: Space play/pause, arrows seek ±5s. These take the
+        // arrows over folder navigation while a clip is open.
+        if let Content::Media(view) = &mut self.content {
+            if !typing && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                view.toggle_play();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                view.seek_by(5.0);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                view.seek_by(-5.0);
+            }
+        } else if !typing {
+            // Arrow keys: scroll through the openable files in the current folder.
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                 self.navigate_dir(ctx, 1);
             } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
@@ -622,6 +666,7 @@ impl eframe::App for App {
                 });
             }
             Content::Text(view) => text_view(ui, view),
+            Content::Media(view) => media_view(ui, view, &self.file_name),
             Content::Csv(data) => csv_table(ui, data),
             Content::Sheets(sd) => csv_table(ui, &sd.sheets[sd.current].1),
             Content::Image(view) => image_view(ui, view),

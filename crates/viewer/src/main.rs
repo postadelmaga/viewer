@@ -81,6 +81,10 @@ fn main() -> eframe::Result<()> {
     let listener = ipc::bind_listener(&sock);
     let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
 
+    // First-run convenience: fetch the MIDI SoundFont in the background so a later
+    // `.mid` plays without a manual step. Best-effort; only the serving instance.
+    viewer_core::midi::ensure_soundfont_background();
+
     // Parallel pipeline: start decoding the initial file NOW, before run_native,
     // so it runs concurrently with the ~65 ms of window/GL initialisation.
     let initial: Option<(PathBuf, Option<Receiver<Decoded>>)> = arg.map(|path| {

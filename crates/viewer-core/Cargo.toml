@@ -16,6 +16,18 @@ pdf = ["dep:pdfium-render"]
 # lean: enable it only in builds that display 3D models. Without it, opening one
 # of these files yields a clear "not compiled in" error.
 mesh = ["dep:gltf"]
+# Audio/video playback via FFmpeg (libav*) + cpal audio output. Off by default:
+# `ffmpeg-the-third` links the system libav* at build time, and cpal pulls ALSA
+# on Linux. Enable it in builds that play media; without it, opening an A/V file
+# yields a clear "not compiled in" error. Decoding streams from the path — the
+# file is never read whole into RAM (see Family::Media in lib.rs).
+# Decoded video frames ride the `micro-media` data plane (a latest-wins, Arc-backed
+# `Frame` channel) rather than being cloned through the control-message enum.
+media = ["dep:ffmpeg-the-third", "dep:cpal", "dep:micro-media"]
+# MIDI playback: parse + SoundFont synthesis via `rustysynth` (pure Rust, no
+# system deps), output through cpal. The SoundFont (.sf2) is a runtime file,
+# resolved by `midi::soundfont_path` and fetched in the background on first run.
+midi = ["dep:rustysynth", "dep:cpal"]
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "tga", "dds", "hdr", "pnm", "qoi", "ff"] }
@@ -31,3 +43,9 @@ zip = "2"
 quick-xml = "0.36"
 pdfium-render = { version = "0.8", optional = true }
 gltf = { version = "1.4", optional = true }
+ffmpeg-the-third = { version = "5", optional = true }
+cpal = { version = "0.15", optional = true }
+rustysynth = { version = "1.3", optional = true }
+# Zero-copy media data plane (latest-wins frame channel + Arc-backed Frame type),
+# borrowed from the sibling `Micro` micro-kernel. Std-only, no bus/runtime pulled in.
+micro-media = { path = "../../../Micro/crates/micro-media", optional = true }

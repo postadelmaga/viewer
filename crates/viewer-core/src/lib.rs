@@ -18,6 +18,8 @@
 
 pub mod csv;
 pub mod image;
+pub mod media;
+pub mod midi;
 pub mod mesh;
 pub mod office;
 #[cfg(feature = "pdf")]
@@ -25,6 +27,7 @@ pub mod pdf;
 pub mod text;
 
 pub use csv::CsvData;
+pub use media::MediaInfo;
 pub use mesh::MeshData;
 pub use office::SheetData;
 
@@ -56,6 +59,9 @@ pub enum Decoded {
     /// A decoded 3D mesh (OBJ / glTF / GLB). Produced only when the `mesh`
     /// feature is enabled; see the [`mesh`] module.
     Mesh(MeshData),
+    /// Probed audio/video metadata. Playback is streamed by the [`media`] worker
+    /// (enabled by the `media` feature); this carries no decoded frames itself.
+    Media(MediaInfo),
     Error(String),
 }
 
@@ -72,6 +78,10 @@ pub enum Family {
     /// often decodes to *fewer* bytes than its source; glTF/GLB is already
     /// binary), and decoding runs off-thread so a big file doesn't block the UI.
     Mesh,
+    /// Audio/video. Never read into RAM: FFmpeg streams from the path, so
+    /// [`decode_with_limits`] skips both the size check and the read for this
+    /// family (a multi-GB video must not be slurped whole).
+    Media,
     /// Everything else (Office/ODF/PDF/SVG/…).
     Other,
 }
@@ -127,6 +137,8 @@ fn registry() -> impl Iterator<Item = &'static Format> {
         .chain(image::FORMATS)
         .chain(office::FORMATS)
         .chain(mesh::FORMATS)
+        .chain(media::FORMATS)
+        .chain(midi::FORMATS)
         .chain(text::FORMATS)
 }
 
@@ -248,6 +260,9 @@ impl SizeLimits {
             Family::Text => self.text_mb,
             Family::Image => self.image_mb,
             Family::Mesh => self.mesh_mb,
+            // Media streams from the path and is never read into RAM, so no
+            // budget applies (the read is skipped in `decode_with_limits`).
+            Family::Media => u64::MAX,
             Family::Other => self.other_mb,
         }
     }
@@ -271,6 +286,17 @@ pub fn decode_with_limits(path: &Path, limits: SizeLimits) -> Decoded {
     // Resolve the format (and thus its size family) before touching the file.
     let format = find_format(&ext);
     let family = format.map_or_else(|| unmatched_family(&ext), |f| f.family);
+
+    // Media is streamed by FFmpeg straight from the path: never read it into
+    // RAM, and skip the size guard. The decoder only probes headers.
+    if family == Family::Media {
+        if let Some(f) = format {
+            return (f.decode)(Input {
+                path: path.to_path_buf(),
+                bytes: Vec::new(),
+            });
+        }
+    }
 
     let max_mb = limits.for_family(family);
     if max_mb != u64::MAX {
@@ -480,6 +506,7 @@ mod tests {
             Decoded::Text(_) => "Text",
             Decoded::Pdf(_) => "Pdf",
             Decoded::Mesh(_) => "Mesh",
+            Decoded::Media(_) => "Media",
             Decoded::Error(_) => "Error",
         }
     }
