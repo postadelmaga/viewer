@@ -180,6 +180,12 @@ fn text_layer(doc: &pdfium_render::prelude::PdfDocument, page: usize, count: usi
         Ok(p) => p,
         Err(e) => return PdfMsg::Err(format!("Pagina non leggibile:\n{e}")),
     };
+    // Char boxes are in the unrotated page frame, but render_page honours the
+    // page's /Rotate, so the rendered image is rotated. Capture the rotation to
+    // map word boxes into the same frame the highlight is drawn over.
+    let rotation = p
+        .rotation()
+        .unwrap_or(pdfium_render::prelude::PdfPageRenderRotation::None);
     let page_w_pt = p.width().value;
     let page_h_pt = p.height().value;
     // A zero-sized page would make every box NaN; report it as empty instead.
@@ -205,7 +211,7 @@ fn text_layer(doc: &pdfium_render::prelude::PdfDocument, page: usize, count: usi
     for ch in text.chars().iter() {
         let c = ch.unicode_char();
         if c.is_none_or(|c| c.is_whitespace()) {
-            flush_word(&mut cur, &mut bbox, page_w_pt, page_h_pt, &mut words);
+            flush_word(&mut cur, &mut bbox, page_w_pt, page_h_pt, rotation, &mut words);
             continue;
         }
         cur.push(c.unwrap());
@@ -222,7 +228,7 @@ fn text_layer(doc: &pdfium_render::prelude::PdfDocument, page: usize, count: usi
             });
         }
     }
-    flush_word(&mut cur, &mut bbox, page_w_pt, page_h_pt, &mut words);
+    flush_word(&mut cur, &mut bbox, page_w_pt, page_h_pt, rotation, &mut words);
 
     PdfMsg::Text {
         page,
@@ -240,16 +246,35 @@ fn flush_word(
     bbox: &mut Option<(f32, f32, f32, f32)>,
     page_w_pt: f32,
     page_h_pt: f32,
+    rotation: pdfium_render::prelude::PdfPageRenderRotation,
     out: &mut Vec<PdfWord>,
 ) {
+    use pdfium_render::prelude::PdfPageRenderRotation as Rot;
     if let (false, Some((l, b, r, t))) = (cur.is_empty(), *bbox) {
+        // Normalised top-left-origin corners in the *unrotated* page frame
+        // (PDF Y grows upward from the bottom, so flip).
+        let (x0, y0) = (l / page_w_pt, (page_h_pt - t) / page_h_pt);
+        let (x1, y1) = (r / page_w_pt, (page_h_pt - b) / page_h_pt);
+        // Rotate each corner clockwise to match the rendered (rotated) image.
+        let rot = |x: f32, y: f32| match rotation {
+            Rot::None => (x, y),
+            Rot::Degrees90 => (1.0 - y, x),
+            Rot::Degrees180 => (1.0 - x, 1.0 - y),
+            Rot::Degrees270 => (y, 1.0 - x),
+        };
+        let (ax, ay) = rot(x0, y0);
+        let (bx, by) = rot(x1, y1);
+        // Clamp the corners jointly so x+w / y+h can't overflow the page rect.
+        let xmin = ax.min(bx).clamp(0.0, 1.0);
+        let xmax = ax.max(bx).clamp(0.0, 1.0);
+        let ymin = ay.min(by).clamp(0.0, 1.0);
+        let ymax = ay.max(by).clamp(0.0, 1.0);
         out.push(PdfWord {
             text: std::mem::take(cur),
-            x: (l / page_w_pt).clamp(0.0, 1.0),
-            // PDF Y grows upward from the bottom; flip to a top-left origin.
-            y: ((page_h_pt - t) / page_h_pt).clamp(0.0, 1.0),
-            w: ((r - l) / page_w_pt).clamp(0.0, 1.0),
-            h: ((t - b) / page_h_pt).clamp(0.0, 1.0),
+            x: xmin,
+            y: ymin,
+            w: xmax - xmin,
+            h: ymax - ymin,
         });
     }
     cur.clear();

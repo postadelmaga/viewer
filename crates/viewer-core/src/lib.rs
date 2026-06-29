@@ -300,13 +300,21 @@ pub fn decode_with_limits(path: &Path, limits: SizeLimits) -> Decoded {
 
     let max_mb = limits.for_family(family);
     if max_mb != u64::MAX {
-        if let Ok(meta) = std::fs::metadata(path) {
+        match std::fs::metadata(path) {
             // Compare in bytes so the limit is exact: a 0 MB limit rejects any
             // non-empty file, and 512 MB doesn't silently tolerate 512.9 MB.
-            if meta.len() > max_mb.saturating_mul(1024 * 1024) {
+            Ok(meta) if meta.len() > max_mb.saturating_mul(1024 * 1024) => {
                 let mb = meta.len() / (1024 * 1024);
                 return Decoded::Error(format!(
                     "File troppo grande: {mb} MB (limite {max_mb} MB per questo formato).\nIl caricamento rischierebbe di esaurire la memoria."
+                ));
+            }
+            Ok(_) => {}
+            // Can't size the file → don't fall through to an unbounded read for a
+            // guarded family; refuse rather than risk exhausting memory.
+            Err(e) => {
+                return Decoded::Error(format!(
+                    "Impossibile determinare la dimensione del file:\n{e}"
                 ));
             }
         }

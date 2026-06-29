@@ -76,17 +76,23 @@ pub fn decode_spreadsheet(bytes: &[u8]) -> Decoded {
 
     fn range_to_csv(range: &Range<Data>) -> CsvData {
         let mut iter = range.rows();
-        let headers: Vec<String> = iter
+        let mut headers: Vec<String> = iter
             .next()
             .map(|r| r.iter().map(|c| c.to_string()).collect())
             .unwrap_or_default();
-        let ncols = headers.len();
 
         let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut width = headers.len();
         for r in iter {
-            let mut row: Vec<String> = r.iter().map(|c| c.to_string()).collect();
-            row.resize(ncols.max(row.len()), String::new());
+            let row: Vec<String> = r.iter().map(|c| c.to_string()).collect();
+            width = width.max(row.len());
             rows.push(row);
+        }
+        // One canonical column count for header + every row (see csv.rs): pad
+        // short rows and never leave a row wider than `headers`.
+        headers.resize(width, String::new());
+        for row in &mut rows {
+            row.resize(width, String::new());
         }
         CsvData { headers, rows }
     }

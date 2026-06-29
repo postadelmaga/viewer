@@ -31,6 +31,12 @@ pub struct CsvData {
     pub rows: Vec<Vec<String>>,
 }
 
+/// Cap on materialised rows. The Text-family byte budget bounds the *input*, but
+/// a file of tiny cells (e.g. `a,a,…`) would still explode into hundreds of
+/// millions of heap `String`s — many GB resident. Stop well before that; a viewer
+/// only needs to show a representative slice.
+const MAX_ROWS: usize = 500_000;
+
 pub fn decode_csv(bytes: &[u8], delim: u8) -> Decoded {
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delim)
@@ -39,18 +45,32 @@ pub fn decode_csv(bytes: &[u8], delim: u8) -> Decoded {
         .from_reader(bytes);
 
     let mut records = rdr.records();
-    let headers: Vec<String> = match records.next() {
+    let mut headers: Vec<String> = match records.next() {
         Some(Ok(r)) => r.iter().map(|s| s.to_string()).collect(),
         Some(Err(e)) => return Decoded::Error(format!("CSV non valido:\n{e}")),
         None => return Decoded::Error("File CSV vuoto".into()),
     };
-    let ncols = headers.len();
 
     let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut width = headers.len();
+    let mut truncated = false;
     for rec in records.flatten() {
-        let mut row: Vec<String> = rec.iter().map(|s| s.to_string()).collect();
-        row.resize(ncols.max(row.len()), String::new());
+        if rows.len() >= MAX_ROWS {
+            truncated = true;
+            break;
+        }
+        let row: Vec<String> = rec.iter().map(|s| s.to_string()).collect();
+        width = width.max(row.len());
         rows.push(row);
+    }
+    if truncated {
+        eprintln!("CSV troncato a {MAX_ROWS} righe (file molto grande)");
+    }
+    // Normalise every record (header included) to one canonical column count so a
+    // consumer can index columns by `headers` without dropping wider rows' cells.
+    headers.resize(width, String::new());
+    for row in &mut rows {
+        row.resize(width, String::new());
     }
 
     Decoded::Csv(CsvData { headers, rows })

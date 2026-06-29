@@ -296,13 +296,18 @@ mod engine {
             _ => None,
         };
 
-        let mut clock = match &audio_out {
-            Some(out) => Clock::Audio {
+        // Drive the clock off audio only when an audio stream is actually being
+        // decoded — `audio_out` is merely an opened output device, which exists on
+        // any machine with a sound card. A video-only file (silent screen capture,
+        // muted webm) has `audio == None`: no samples are ever pushed, so an Audio
+        // clock would stay pinned at 0 and the presenter would wait forever.
+        let mut clock = match (&audio_out, audio.is_some()) {
+            (Some(out), true) => Clock::Audio {
                 consumed: out.consumed.clone(),
                 rate: out.rate,
                 base: 0.0,
             },
-            None => Clock::Wall {
+            _ => Clock::Wall {
                 base: 0.0,
                 anchor: Instant::now(),
                 playing: true,
@@ -445,26 +450,37 @@ mod engine {
                 clock.set_playing(false);
                 let _ = msg_tx.send(MediaMsg::Eof);
                 wake();
-                // Idle until a seek or stop.
-                match wait_cmd(cmd_rx, &mut playing, &audio_out, &mut clock) {
-                    Control::Seek(t) => {
-                        seek(&mut ictx, t);
-                        if let Some(v) = &mut video {
-                            v.decoder.flush();
+                // Idle until a command. `wait_cmd` returns `Control::None` for
+                // Play/Pause/TogglePlay (after applying them), so loop instead of
+                // exiting: a Play at EOF must restart, not kill the worker.
+                let restart_at = loop {
+                    match wait_cmd(cmd_rx, &mut playing, &audio_out, &mut clock) {
+                        Control::Seek(t) => break t,
+                        Control::Stop => return Ok(()),
+                        // Resumed playback: the packet iterator is exhausted, so
+                        // replay from the top. Still paused: keep idling.
+                        Control::None => {
+                            if playing {
+                                break 0.0;
+                            }
                         }
-                        if let Some(a) = &mut audio {
-                            a.decoder.flush();
-                        }
-                        if let Some(out) = &audio_out {
-                            out.ring.lock().unwrap().clear();
-                            out.consumed.store(0, Ordering::Relaxed);
-                        }
-                        clock.seek(t);
-                        continue;
                     }
-                    Control::Stop => return Ok(()),
-                    Control::None => return Ok(()),
+                };
+                seek(&mut ictx, restart_at);
+                if let Some(v) = &mut video {
+                    v.decoder.flush();
                 }
+                if let Some(a) = &mut audio {
+                    a.decoder.flush();
+                }
+                if let Some(out) = &audio_out {
+                    out.ring.lock().unwrap().clear();
+                    out.consumed.store(0, Ordering::Relaxed);
+                }
+                clock.seek(restart_at);
+                let _ = msg_tx.send(MediaMsg::Position(restart_at));
+                wake();
+                continue;
             }
         }
     }

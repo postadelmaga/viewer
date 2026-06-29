@@ -212,14 +212,33 @@ mod engine {
 
         loop {
             match cmd_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(MediaCmd::Play) => playing.store(true, Ordering::Relaxed),
+                Ok(MediaCmd::Play) => {
+                    // A finished sequence sits at the end; Play would re-detect
+                    // EOF and re-pause. Restart from the top instead.
+                    if ended {
+                        seek(&sequencer, &midi, rate, channels, 0.0);
+                        rendered.store(0, Ordering::Relaxed);
+                        ended = false;
+                    }
+                    playing.store(true, Ordering::Relaxed);
+                }
                 Ok(MediaCmd::Pause) => playing.store(false, Ordering::Relaxed),
                 Ok(MediaCmd::TogglePlay) => {
                     let p = !playing.load(Ordering::Relaxed);
+                    if p && ended {
+                        seek(&sequencer, &midi, rate, channels, 0.0);
+                        rendered.store(0, Ordering::Relaxed);
+                        ended = false;
+                    }
                     playing.store(p, Ordering::Relaxed);
                 }
                 Ok(MediaCmd::Seek(t)) => {
                     let t = t.clamp(0.0, duration);
+                    // Mute during the fast-forward: while paused the audio
+                    // callback early-returns without locking the sequencer, so the
+                    // seek holds the lock uncontended instead of stalling the
+                    // realtime thread for the whole render-and-discard.
+                    playing.store(false, Ordering::Relaxed);
                     seek(&sequencer, &midi, rate, channels, t);
                     rendered.store((t * rate as f64) as u64, Ordering::Relaxed);
                     ended = false;
