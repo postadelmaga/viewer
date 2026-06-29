@@ -2,7 +2,6 @@
 
 use super::{Decoded, Family, Format, Input};
 use std::io::Cursor;
-use std::sync::OnceLock;
 
 /// Formats this module handles (see [`crate::Format`]). SVG is `Other` family —
 /// it's vector source, not a w·h·4 raster — while rasters use the image budget.
@@ -127,30 +126,13 @@ pub fn decode_image_ext(bytes: &[u8], ext: &str) -> Decoded {
     }
 }
 
-/// System fonts are expensive to enumerate (~1s cold), so load them once and
-/// only when an SVG actually needs them.
-fn svg_fontdb() -> &'static resvg::usvg::fontdb::Database {
-    static DB: OnceLock<resvg::usvg::fontdb::Database> = OnceLock::new();
-    DB.get_or_init(|| {
-        let mut db = resvg::usvg::fontdb::Database::new();
-        db.load_system_fonts();
-        db
-    })
-}
-
 pub fn decode_svg(bytes: &[u8]) -> Decoded {
     use resvg::tiny_skia;
     use resvg::usvg;
 
-    // Only pay for system fonts if the SVG has text (or is gzipped and unscannable).
-    let needs_fonts = bytes.starts_with(&[0x1f, 0x8b])
-        || contains_sub(bytes, b"<text")
-        || contains_sub(bytes, b"<tspan");
-
-    let mut opt = usvg::Options::default();
-    if needs_fonts {
-        *opt.fontdb_mut() = svg_fontdb().clone();
-    }
+    // Text shaping is compiled out (see Cargo.toml): we render shapes/paths only,
+    // so no font database is needed. `<text>` elements are skipped.
+    let opt = usvg::Options::default();
 
     let tree = match usvg::Tree::from_data(bytes, &opt) {
         Ok(t) => t,
@@ -178,14 +160,6 @@ pub fn decode_svg(bytes: &[u8]) -> Decoded {
         premultiplied: true,
         kind: format!("SVG {}×{}", size.width() as i32, size.height() as i32),
     }
-}
-
-/// Substring search over raw bytes (std has none for slices).
-fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return needle.is_empty();
-    }
-    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 #[cfg(test)]
