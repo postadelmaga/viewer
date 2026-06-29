@@ -87,39 +87,48 @@ pub(crate) fn csv_table(ui: &mut egui::Ui, view: &CsvView) {
     let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 6.0;
     let ncols = data.headers.len();
 
-    TableBuilder::new(ui)
-        .striped(true)
-        .resizable(true)
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::auto()) // row number
-        .columns(Column::initial(140.0).at_least(40.0).clip(true), ncols)
-        .min_scrolled_height(0.0)
+    // egui_extras 0.29's Table scrolls vertically only — a wide table would clip
+    // its right-hand columns out of reach. Wrap it in a horizontal ScrollArea:
+    // the columns are absolute-width, so the (infinite) width inside the scroll
+    // area keeps them at size and the overflow becomes a horizontal scrollbar.
+    // The Table keeps its own vertical scroll, so row virtualisation still holds.
+    egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
-        .header(text_height + 4.0, |mut header| {
-            header.col(|ui| {
-                ui.strong("#");
-            });
-            for h in &data.headers {
-                header.col(|ui| {
-                    ui.strong(h);
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(text_height, view.filtered.len(), |mut row| {
-                let src = view.filtered[row.index()];
-                row.col(|ui| {
-                    ui.weak((src + 1).to_string());
-                });
-                let cells = &data.rows[src];
-                for c in 0..ncols {
-                    row.col(|ui| {
-                        if let Some(v) = cells.get(c) {
-                            ui.label(v);
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto()) // row number
+                .columns(Column::initial(140.0).at_least(40.0).clip(true), ncols)
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, false])
+                .header(text_height + 4.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("#");
+                    });
+                    for h in &data.headers {
+                        header.col(|ui| {
+                            ui.strong(h);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(text_height, view.filtered.len(), |mut row| {
+                        let src = view.filtered[row.index()];
+                        row.col(|ui| {
+                            ui.weak((src + 1).to_string());
+                        });
+                        let cells = &data.rows[src];
+                        for c in 0..ncols {
+                            row.col(|ui| {
+                                if let Some(v) = cells.get(c) {
+                                    ui.label(v);
+                                }
+                            });
                         }
                     });
-                }
-            });
+                });
         });
 }
 
