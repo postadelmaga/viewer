@@ -1,7 +1,7 @@
 //! Application state and the egui update loop.
 
 use crate::ui::image_view::{image_view, ImageView};
-use crate::ui::media_view::{media_toolbar, media_view, MediaView};
+use crate::ui::media_view::{media_view, MediaView};
 use crate::ui::mesh_view::{mesh_view, MeshView};
 use crate::ui::pdf_view::{prepare_pdf, PdfView};
 use crate::ui::table::{csv_table, csv_toolbar, CsvView, SheetView};
@@ -58,6 +58,25 @@ pub(crate) struct App {
     /// The glow context, captured once so a replaced mesh's GPU buffers can be
     /// freed while the context is still current (fixes a file-switch leak).
     gl: Option<std::sync::Arc<eframe::glow::Context>>,
+    /// `--screenshot OUT`: render the file, capture the window once it has
+    /// painted, write the PNG to OUT and exit. `None` in normal interactive use.
+    screenshot: Option<PathBuf>,
+    /// Screenshot capture state machine (only used when `screenshot` is set).
+    shot: ShotState,
+}
+
+/// Drives the one-shot `--screenshot` capture across frames: wait for the
+/// content to actually be on screen, let it settle a few frames so textures
+/// finish uploading, ask eframe for the framebuffer, then save and quit.
+#[derive(Default)]
+struct ShotState {
+    /// When screenshot mode started painting (for the content-load timeout).
+    started: Option<Instant>,
+    /// Consecutive frames the content has been displayable.
+    settle: u32,
+    /// When the framebuffer read-back was requested (for its own timeout), so a
+    /// missing reply event can't wedge the process — it closes instead of looping.
+    requested_at: Option<Instant>,
 }
 
 /// Apply the app's visual theme: a modern dark palette with an accent colour,
@@ -146,6 +165,8 @@ impl Default for App {
             reported_ready: false,
             copy_status: None,
             gl: None,
+            screenshot: None,
+            shot: ShotState::default(),
         }
     }
 }
@@ -154,12 +175,33 @@ impl App {
     /// How long a resident (hidden) Quick Look instance lingers before quitting.
     const IDLE_QUIT: std::time::Duration = std::time::Duration::from_secs(300);
 
-    pub(crate) fn new(inbox: Option<Receiver<PathBuf>>, quicklook: bool) -> Self {
+    /// Frames the content must stay displayable before we grab the framebuffer,
+    /// so textures (image/PDF/mesh) finish uploading and paint at least once.
+    const SHOT_SETTLE_FRAMES: u32 = 3;
+    /// Hard cap on waiting for content to load: capture whatever is on screen if
+    /// it never settles (e.g. a slow/stuck decode, or a stream with no frames).
+    const SHOT_CONTENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Hard cap on waiting for the framebuffer read-back reply after requesting
+    /// it, so a missing event closes the window rather than spinning forever.
+    const SHOT_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    pub(crate) fn new(
+        inbox: Option<Receiver<PathBuf>>,
+        quicklook: bool,
+        screenshot: Option<PathBuf>,
+    ) -> Self {
         App {
             inbox,
             quicklook,
+            screenshot,
             ..Default::default()
         }
+    }
+
+    /// Whether the content is actually on screen (not a spinner/placeholder).
+    /// Used by the headless renderer to know when the capture is worth taking.
+    pub(crate) fn content_ready(&self) -> bool {
+        content_displayable(&self.content)
     }
 
     /// Dismiss the window: in Quick Look mode hide but stay resident (instant
@@ -296,6 +338,59 @@ impl App {
         self.copy_status = Some((msg, Instant::now()));
     }
 
+    /// One-shot screenshot capture (`--screenshot`). Driven once per frame: wait
+    /// for the content to be on screen, let it settle so textures upload, ask
+    /// eframe to read back the framebuffer, then save the PNG and close.
+    fn maybe_capture_screenshot(&mut self, ctx: &egui::Context) {
+        let Some(out) = self.screenshot.clone() else {
+            return;
+        };
+        let started = *self.shot.started.get_or_insert_with(Instant::now);
+
+        // The read-back arrives as an input event the frame after we request it.
+        let captured = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(capture) = captured {
+            save_screenshot(&out, &capture);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // Already asked: keep frames flowing until the reply lands, but give up
+        // (close cleanly) if it never does, rather than spinning forever.
+        if let Some(req_at) = self.shot.requested_at {
+            if req_at.elapsed() >= Self::SHOT_READBACK_TIMEOUT {
+                eprintln!("viewer: screenshot timed out waiting for the framebuffer read-back");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        // Wait for painted content (or give up after the timeout), settle a few
+        // frames so image/PDF/mesh textures finish uploading, then request.
+        let displayable = content_displayable(&self.content);
+        let timed_out = started.elapsed() >= Self::SHOT_CONTENT_TIMEOUT;
+        if displayable || timed_out {
+            self.shot.settle += 1;
+        } else {
+            self.shot.settle = 0;
+        }
+        if self.shot.settle >= Self::SHOT_SETTLE_FRAMES || timed_out {
+            if timed_out && !displayable {
+                eprintln!("viewer: content did not finish loading; capturing the current frame");
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            self.shot.requested_at = Some(Instant::now());
+        }
+        ctx.request_repaint();
+    }
+
     /// Per-content controls shown in the toolbar.
     fn toolbar_extras(&mut self, ui: &mut egui::Ui) {
         match &mut self.content {
@@ -355,7 +450,10 @@ impl App {
                 }
                 ui.label("Ctrl+rotella = zoom");
             }
-            Content::Media(view) => media_toolbar(ui, view),
+            // The media transport (play · time · seek) now lives at the bottom of
+            // the window — an always-visible bar for audio, an auto-hiding overlay
+            // for video — so the top toolbar carries nothing for media.
+            Content::Media(_) => {}
             Content::Pdf(pdf) => {
                 if ui.button("◀").clicked() && pdf.page > 0 {
                     pdf.page -= 1;
@@ -384,6 +482,24 @@ impl App {
     }
 }
 
+/// Encode an egui framebuffer capture (`Color32` pixels) as a PNG at `path`.
+/// The file format is inferred from the extension, so callers should pass a
+/// `.png` path. Errors are reported to stderr — capture mode is best-effort.
+fn save_screenshot(path: &Path, capture: &egui::ColorImage) {
+    let [w, h] = capture.size;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for px in &capture.pixels {
+        rgba.extend_from_slice(&[px.r(), px.g(), px.b(), px.a()]);
+    }
+    match image::RgbaImage::from_raw(w as u32, h as u32, rgba) {
+        Some(img) => match img.save(path) {
+            Ok(()) => eprintln!("viewer: screenshot saved to {}", path.display()),
+            Err(e) => eprintln!("viewer: failed to save screenshot to {}: {e}", path.display()),
+        },
+        None => eprintln!("viewer: screenshot capture had invalid dimensions"),
+    }
+}
+
 /// Build the live `Content` from a decode result, creating GPU textures.
 fn build_content(ctx: &egui::Context, decoded: Decoded, path: &Path) -> Content {
     let ext = path
@@ -408,6 +524,10 @@ fn build_content(ctx: &egui::Context, decoded: Decoded, path: &Path) -> Content 
             // Data plane for decoded video frames (latest-wins, Arc-backed). For MIDI
             // (audio-only) the sender is simply dropped, closing the empty channel.
             let (frame_tx, frame_rx) = micro_media::latest::<micro_media::Frame>();
+            // Tap of recently-played audio samples for the oscilloscope; the
+            // worker fills it, the view reads it.
+            let scope = micro_media::Scope::new();
+            let scope_worker = scope.clone();
             let ctx2 = ctx.clone();
             let p = path.to_path_buf();
             let is_midi = matches!(ext.as_str(), "mid" | "midi");
@@ -415,12 +535,12 @@ fn build_content(ctx: &egui::Context, decoded: Decoded, path: &Path) -> Content 
                 let wake = move || ctx2.request_repaint();
                 if is_midi {
                     drop(frame_tx);
-                    midi_worker(p, cmd_rx, msg_tx, wake)
+                    midi_worker(p, cmd_rx, msg_tx, scope_worker, wake)
                 } else {
-                    media_worker(p, cmd_rx, msg_tx, frame_tx, wake)
+                    media_worker(p, cmd_rx, msg_tx, frame_tx, scope_worker, wake)
                 }
             });
-            Content::Media(MediaView::new(info, cmd_tx, msg_rx, frame_rx))
+            Content::Media(MediaView::new(info, cmd_tx, msg_rx, frame_rx, scope))
         }
         Decoded::Error(e) => Content::Error(e),
         Decoded::Image {
@@ -466,13 +586,20 @@ fn content_displayable(c: &Content) -> bool {
     }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+impl App {
+    /// The per-frame UI + input logic, factored out of `eframe::App::update` so the
+    /// headless renderer (which has no `eframe::Frame`) can drive the exact same
+    /// drawing with its own glow context. `gl` is the live OpenGL context, if any.
+    pub(crate) fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        gl: Option<&std::sync::Arc<eframe::glow::Context>>,
+    ) {
         let is_first = self.first_frame;
         // Capture the glow context once so set_content() can free a replaced
         // mesh's GPU buffers while the context is still current.
         if self.gl.is_none() {
-            self.gl = frame.gl().cloned();
+            self.gl = gl.cloned();
         }
 
         // Files handed over by later invocations (single instance).
@@ -690,7 +817,7 @@ impl eframe::App for App {
             Content::Csv(data) => csv_table(ui, data),
             Content::Sheets(sd) => csv_table(ui, &sd.sheets[sd.current].1),
             Content::Image(view) => image_view(ui, view),
-            Content::Mesh(view) => mesh_view(ui, view, frame.gl()),
+            Content::Mesh(view) => mesh_view(ui, view, gl),
             Content::Markdown(text) => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.md_cache, text);
@@ -765,6 +892,12 @@ impl eframe::App for App {
             }
         }
 
+        // `--screenshot`: once the content has painted, grab the framebuffer,
+        // write the PNG and quit.
+        if self.screenshot.is_some() {
+            self.maybe_capture_screenshot(ctx);
+        }
+
         // Benchmark checkpoints (VIEWER_BENCH): window shown, then content ready.
         if self.first_frame {
             self.first_frame = false;
@@ -777,6 +910,12 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.ui(ctx, frame.gl());
     }
 
     /// Transparent clear colour so the panels paint their own (frosted) fills

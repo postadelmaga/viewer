@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="256" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6E8BFF"/>
+      <stop offset="0.52" stop-color="#6286F8"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="0" y1="56" x2="0" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E7EDFD"/>
+    </linearGradient>
+    <radialGradient id="topglow" cx="0.32" cy="0.20" r="0.9">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="ap">
+      <rect x="0" y="0" width="256" height="256" fill="black"/>
+      <circle cx="128.0" cy="128.0" r="72.0" fill="white"/>
+      <path d="M 128.00 102.00 L 150.52 115.00 L 150.52 141.00 L 128.00 154.00 L 105.48 141.00 L 105.48 115.00 Z" fill="black"/>
+      <line x1="128.00" y1="102.00" x2="176.85" y2="73.75" stroke="black" stroke-width="9.0" stroke-linecap="round"/>
+      <line x1="150.52" y1="115.00" x2="199.40" y2="143.18" stroke="black" stroke-width="9.0" stroke-linecap="round"/>
+      <line x1="150.52" y1="141.00" x2="150.56" y2="197.43" stroke="black" stroke-width="9.0" stroke-linecap="round"/>
+      <line x1="128.00" y1="154.00" x2="79.15" y2="182.25" stroke="black" stroke-width="9.0" stroke-linecap="round"/>
+      <line x1="105.48" y1="141.00" x2="56.60" y2="112.82" stroke="black" stroke-width="9.0" stroke-linecap="round"/>
+      <line x1="105.48" y1="115.00" x2="105.44" y2="58.57" stroke="black" stroke-width="9.0" stroke-linecap="round"/>
+    </mask>
+  </defs>
+
+  <!-- container squircle -->
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#bg)"/>
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#topglow)"/>
+
+  <!-- soft drop under the lens for depth -->
+  <circle cx="128.0" cy="133.0" r="72.0" fill="#1A1330" opacity="0.18"/>
+
+  <!-- aperture: white lens with hexagonal opening revealing the gradient -->
+  <circle cx="128.0" cy="128.0" r="72.0" fill="url(#lens)" mask="url(#ap)"/>
+
+  <!-- inner ring + glass highlight -->
+  <circle cx="128.0" cy="128.0" r="72.0" fill="none" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="2"/>
+  <circle cx="100.52" cy="92.82" r="6.5" fill="#FFFFFF" opacity="0.9"/>
+
+  <!-- crisp 1px inner edge on the squircle -->
+  <rect x="8.5" y="8.5" width="239" height="239" rx="57.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.18"/>
+</svg>

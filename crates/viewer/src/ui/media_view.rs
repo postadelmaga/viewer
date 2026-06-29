@@ -7,7 +7,7 @@
 
 use eframe::egui;
 use egui::{Color32, Pos2, TextureHandle, TextureOptions, Vec2};
-use micro_media::{Frame, LatestReceiver, PixelFormat};
+use micro_media::{Frame, LatestReceiver, PixelFormat, Scope};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 use viewer_core::media::{MediaCmd, MediaMsg};
@@ -19,6 +19,10 @@ pub(crate) struct MediaView {
     msg_rx: Receiver<MediaMsg>,
     /// Data plane: decoded video frames, latest-wins. Empty for audio-only sources.
     frame_rx: LatestReceiver<Frame>,
+    /// Tap of recently-played audio samples, drawn as the oscilloscope.
+    scope: Scope,
+    /// Scratch buffer for the latest oscilloscope window (reused each repaint).
+    scope_buf: Vec<f32>,
     texture: Option<TextureHandle>,
     tex_size: Vec2,
     position: f64,
@@ -43,12 +47,15 @@ impl MediaView {
         cmd_tx: Sender<MediaCmd>,
         msg_rx: Receiver<MediaMsg>,
         frame_rx: LatestReceiver<Frame>,
+        scope: Scope,
     ) -> Self {
         Self {
             info,
             cmd_tx,
             msg_rx,
             frame_rx,
+            scope,
+            scope_buf: Vec::new(),
             texture: None,
             tex_size: Vec2::ZERO,
             position: 0.0,
@@ -129,6 +136,11 @@ impl MediaView {
                 MediaMsg::Eof => {
                     self.ended = true;
                     self.playing = false;
+                    // Snap the bar to the very end: the last reported position can
+                    // sit a hair short of the duration.
+                    if self.info.duration > 0.0 && !self.scrubbing {
+                        self.position = self.info.duration;
+                    }
                 }
                 MediaMsg::Error(e) => self.error = Some(e),
             }
@@ -219,8 +231,10 @@ fn seek_bar(ui: &mut egui::Ui, view: &mut MediaView, width: f32) {
     }
 }
 
-/// Transport controls, drawn in the always-visible top toolbar.
-pub(crate) fn media_toolbar(ui: &mut egui::Ui, view: &mut MediaView) {
+/// The transport row — play · elapsed/total · seek bar — laid out left-to-right
+/// inside whatever `ui` it is given. Shared by the audio bar and the video
+/// overlay so both read and behave identically.
+fn transport_row(ui: &mut egui::Ui, view: &mut MediaView) {
     if ui
         .button(view.play_label())
         .on_hover_text("Play/Pausa (Spazio)")
@@ -237,6 +251,47 @@ pub(crate) fn media_toolbar(ui: &mut egui::Ui, view: &mut MediaView) {
         let w = ui.available_width();
         seek_bar(ui, view, w);
     }
+}
+
+/// Paint a control bar filling `bar`: a translucent backdrop plus the transport
+/// row. Used for both the always-visible audio bar and the auto-hiding video
+/// overlay, so the seek bar always sits at the bottom of the window.
+fn transport_bar(ui: &mut egui::Ui, view: &mut MediaView, bar: egui::Rect) {
+    ui.painter()
+        .rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(18, 19, 24, 190));
+    let inner = bar.shrink2(egui::vec2(12.0, 8.0));
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
+        ui.horizontal_centered(|ui| transport_row(ui, view));
+    });
+}
+
+/// Draw the audio oscilloscope — the latest played-samples window as a waveform —
+/// filling `rect`, with a faint baseline so silence still reads as a flat line.
+fn oscilloscope(ui: &mut egui::Ui, view: &mut MediaView, rect: egui::Rect) {
+    view.scope.snapshot(&mut view.scope_buf);
+    let p = ui.painter();
+    let mid = rect.center().y;
+    p.line_segment(
+        [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
+        egui::Stroke::new(1.0, Color32::from_gray(60)),
+    );
+    let n = view.scope_buf.len();
+    if n < 2 {
+        return;
+    }
+    // Leave a little headroom so peaks at full scale don't clip the band edge.
+    let amp = rect.height() * 0.45;
+    let denom = (n - 1) as f32;
+    let points: Vec<Pos2> = view
+        .scope_buf
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let x = rect.left() + rect.width() * (i as f32 / denom);
+            egui::pos2(x, mid - s.clamp(-1.0, 1.0) * amp)
+        })
+        .collect();
+    p.add(egui::Shape::line(points, egui::Stroke::new(1.5, ACCENT)));
 }
 
 /// Central video surface (or an audio placeholder), updated each frame.
@@ -294,38 +349,36 @@ pub(crate) fn media_view(ui: &mut egui::Ui, view: &mut MediaView, file_name: &st
                 .request_repaint_after(std::time::Duration::from_millis(400));
         }
     } else {
-        // Audio-only / MIDI (or video not yet decoded): a centered card.
-        ui.centered_and_justified(|ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
-                ui.heading(if view.info.has_video { "▶" } else { "♪" });
-                ui.add_space(6.0);
-                ui.label(file_name);
+        // Audio-only / MIDI (or video not yet decoded): a small oscilloscope card
+        // above an always-visible transport bar pinned to the bottom of the window.
+        let area = ui.max_rect();
+        let bar_h = 46.0;
+        let content =
+            egui::Rect::from_min_max(area.min, egui::pos2(area.right(), area.bottom() - bar_h));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), |ui| {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading(if view.info.has_video { "▶" } else { "♪" });
+                    ui.add_space(10.0);
+                    // A small scope band: most of the width, capped so it stays
+                    // compact in a maximised window.
+                    let w = (ui.available_width() - 24.0).clamp(120.0, 560.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(w, 80.0), egui::Sense::hover());
+                    oscilloscope(ui, view, rect);
+                    ui.add_space(10.0);
+                    ui.label(file_name);
+                });
             });
         });
+        let bar =
+            egui::Rect::from_min_max(egui::pos2(area.left(), area.bottom() - bar_h), area.max);
+        transport_bar(ui, view, bar);
     }
 }
 
 /// Auto-hiding control bar drawn over the bottom of the video.
 fn video_overlay(ui: &mut egui::Ui, view: &mut MediaView, area: egui::Rect, bar_h: f32) {
     let bar = egui::Rect::from_min_max(egui::pos2(area.left(), area.bottom() - bar_h), area.max);
-    ui.painter()
-        .rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(18, 19, 24, 190));
-    let inner = bar.shrink2(egui::vec2(12.0, 8.0));
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
-        ui.horizontal_centered(|ui| {
-            if ui.button(view.play_label()).clicked() {
-                view.toggle_play();
-            }
-            ui.label(format!(
-                "{} / {}",
-                fmt_time(view.shown_pos()),
-                fmt_time(view.info.duration.max(0.0))
-            ));
-            if view.info.duration > 0.0 {
-                let w = ui.available_width();
-                seek_bar(ui, view, w);
-            }
-        });
-    });
+    transport_bar(ui, view, bar);
 }

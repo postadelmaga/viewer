@@ -21,7 +21,9 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
+pub mod scope;
 pub mod types;
+pub use scope::Scope;
 pub use types::{AudioBlock, Frame, PixelFormat};
 
 // --- latest-wins single-slot mailbox (video) -----------------------------------------------

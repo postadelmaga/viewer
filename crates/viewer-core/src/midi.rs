@@ -123,9 +123,10 @@ mod engine {
         path: PathBuf,
         cmd_rx: Receiver<MediaCmd>,
         msg_tx: Sender<MediaMsg>,
+        scope: micro_media::Scope,
         wake: F,
     ) {
-        if let Err(e) = run_midi(&path, &cmd_rx, &msg_tx, &wake) {
+        if let Err(e) = run_midi(&path, &cmd_rx, &msg_tx, &scope, &wake) {
             let _ = msg_tx.send(MediaMsg::Error(e));
             wake();
         }
@@ -135,6 +136,7 @@ mod engine {
         path: &Path,
         cmd_rx: &Receiver<MediaCmd>,
         msg_tx: &Sender<MediaMsg>,
+        scope: &micro_media::Scope,
         wake: &F,
     ) -> Result<(), String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -176,6 +178,7 @@ mod engine {
         let rendered = Arc::new(AtomicU64::new(0)); // per-channel frames synthesised
 
         let (seq_cb, play_cb, rend_cb) = (sequencer.clone(), playing.clone(), rendered.clone());
+        let scope_cb = scope.clone();
         let mut lbuf: Vec<f32> = Vec::new();
         let mut rbuf: Vec<f32> = Vec::new();
         let stream = device
@@ -200,6 +203,8 @@ mod engine {
                         }
                     }
                     rend_cb.fetch_add(frames as u64, Ordering::Relaxed);
+                    // Tap the synthesised output for the UI's oscilloscope.
+                    scope_cb.push_interleaved(data, channels);
                 },
                 |e| eprintln!("audio stream error: {e}"),
                 None,

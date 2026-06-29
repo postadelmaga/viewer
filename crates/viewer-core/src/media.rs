@@ -88,7 +88,7 @@ mod engine {
     use std::time::{Duration, Instant};
 
     use ffmpeg_the_third as ff;
-    use micro_media::{Frame, LatestSender, PixelFormat};
+    use micro_media::{Frame, LatestSender, PixelFormat, Scope};
 
     const AV_TIME_BASE: f64 = 1_000_000.0;
     /// Cap the decoded frame width so texture uploads stay cheap; the UI scales
@@ -137,9 +137,10 @@ mod engine {
         cmd_rx: Receiver<MediaCmd>,
         msg_tx: Sender<MediaMsg>,
         frame_tx: LatestSender<Frame>,
+        scope: Scope,
         wake: F,
     ) {
-        if let Err(e) = run(&path, &cmd_rx, &msg_tx, &frame_tx, &wake) {
+        if let Err(e) = run(&path, &cmd_rx, &msg_tx, &frame_tx, &scope, &wake) {
             let _ = msg_tx.send(MediaMsg::Error(e));
             wake();
         }
@@ -156,7 +157,7 @@ mod engine {
         channels: usize,
     }
 
-    fn build_audio() -> Option<AudioOut> {
+    fn build_audio(scope: Scope) -> Option<AudioOut> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let device = cpal::default_host().default_output_device()?;
         let config = device.default_output_config().ok()?;
@@ -186,9 +187,12 @@ mod engine {
                             None => *s = 0.0,
                         }
                     }
+                    drop(ring);
                     // Only real samples advance the clock; an underrun (silence)
                     // doesn't, so video stays paced to actual audio output.
                     c.fetch_add((got / channels.max(1)) as u64, Ordering::Relaxed);
+                    // Tap the actual output for the UI's oscilloscope.
+                    scope.push_interleaved(data, channels.max(1));
                 },
                 |e| eprintln!("audio stream error: {e}"),
                 None,
@@ -273,6 +277,7 @@ mod engine {
         cmd_rx: &Receiver<MediaCmd>,
         msg_tx: &Sender<MediaMsg>,
         frame_tx: &LatestSender<Frame>,
+        scope: &Scope,
         wake: &F,
     ) -> Result<(), String> {
         ff::init().map_err(|e| e.to_string())?;
@@ -290,7 +295,7 @@ mod engine {
             None => None,
         };
         // Audio output + decoder + resampler.
-        let audio_out = build_audio();
+        let audio_out = build_audio(scope.clone());
         let mut audio = match (a_idx, &audio_out) {
             (Some(i), Some(out)) => Some(setup_audio(&ictx, i, out)?),
             _ => None,
@@ -404,20 +409,34 @@ mod engine {
                         if let (Some(a), Some(out)) = (&mut audio, &audio_out) {
                             let _ = a.decoder.send_packet(&packet);
                             while a.decoder.receive_frame(&mut aframe).is_ok() {
-                                push_audio(a, out, &aframe);
+                                push_audio(a, out, &mut aframe);
                             }
                             let _ = msg_tx.send(MediaMsg::Position(clock.now()));
                             wake();
                         }
                     }
 
-                    // Backpressure for audio-only streams (video is paced by
-                    // present_wait): if the ring holds >~2s, pause a beat. Commands
-                    // stay queued and are polled at the top of the next iteration.
-                    if let Some(out) = &audio_out {
-                        if playing && over_buffered(out) {
-                            std::thread::sleep(Duration::from_millis(15));
+                    // Backpressure: while the audio ring already buffers >~2s, hold
+                    // here rather than decoding ahead to end-of-stream. Without this
+                    // the demuxer races to EOF (a short file decodes entirely before a
+                    // note has played), the UI sees `Eof` and freezes the seek bar far
+                    // from where the audio actually is. Keep polling controls and
+                    // reporting the clock so the position still advances while we wait.
+                    while playing && audio_out.as_ref().is_some_and(over_buffered) {
+                        match poll_cmds(cmd_rx, &mut playing, &audio_out, &mut clock) {
+                            Control::None => {}
+                            Control::Seek(t) => {
+                                pending_seek = Some(t);
+                                break 'packets;
+                            }
+                            Control::Stop => {
+                                stop = true;
+                                break 'packets;
+                            }
                         }
+                        let _ = msg_tx.send(MediaMsg::Position(clock.now()));
+                        wake();
+                        std::thread::sleep(Duration::from_millis(20));
                     }
                 }
             }
@@ -443,6 +462,31 @@ mod engine {
                 continue;
             }
             if eof {
+                // Out of packets, but the audio ring may still hold buffered samples.
+                // Drain them — reporting the clock so the seek bar runs to the end —
+                // before declaring the end. Otherwise a file that decoded ahead would
+                // report EOF while seconds of audio are still playing.
+                match drain_audio(&audio_out, cmd_rx, &mut playing, &mut clock, msg_tx, wake) {
+                    Control::Stop => return Ok(()),
+                    Control::Seek(t) => {
+                        seek(&mut ictx, t);
+                        if let Some(v) = &mut video {
+                            v.decoder.flush();
+                        }
+                        if let Some(a) = &mut audio {
+                            a.decoder.flush();
+                        }
+                        if let Some(out) = &audio_out {
+                            out.ring.lock().unwrap().clear();
+                            out.consumed.store(0, Ordering::Relaxed);
+                        }
+                        clock.seek(t);
+                        let _ = msg_tx.send(MediaMsg::Position(t));
+                        wake();
+                        continue;
+                    }
+                    Control::None => {}
+                }
                 playing = false;
                 if let Some(out) = &audio_out {
                     out.playing.store(false, Ordering::Relaxed);
@@ -573,6 +617,49 @@ mod engine {
         out.ring.lock().unwrap().len() as f64 / (out.rate as f64 * out.channels as f64) > 2.0
     }
 
+    /// Block until the audio buffered in the ring has played out, reporting the
+    /// clock so the seek bar advances to the end. Returns the control that
+    /// interrupted it (`Seek`/`Stop`), or `None` once the ring is empty. A stall
+    /// guard bails if the ring stops draining (e.g. a wedged output device) so the
+    /// worker can never hang here.
+    fn drain_audio<F: Fn()>(
+        audio: &Option<AudioOut>,
+        cmd_rx: &Receiver<MediaCmd>,
+        playing: &mut bool,
+        clock: &mut Clock,
+        msg_tx: &Sender<MediaMsg>,
+        wake: &F,
+    ) -> Control {
+        let Some(out) = audio else {
+            return Control::None;
+        };
+        let mut last = usize::MAX;
+        let mut stalls = 0u32;
+        loop {
+            match poll_cmds(cmd_rx, playing, audio, clock) {
+                Control::None => {}
+                other => return other,
+            }
+            if !*playing {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let remaining = out.ring.lock().unwrap().len();
+            let _ = msg_tx.send(MediaMsg::Position(clock.now()));
+            wake();
+            if remaining == 0 {
+                return Control::None;
+            }
+            // No progress for ~1.2s means the device isn't pulling: stop waiting.
+            stalls = if remaining < last { 0 } else { stalls + 1 };
+            if stalls > 40 {
+                return Control::None;
+            }
+            last = remaining;
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
     struct VideoDec {
         decoder: ff::decoder::Video,
         scaler: ff::software::scaling::Context,
@@ -624,19 +711,39 @@ mod engine {
             .map_err(|e| e.to_string())?;
         let decoder = ctx.decoder().audio().map_err(|e| e.to_string())?;
         // Resample the decoder's native format to interleaved f32 at the device's
-        // layout/rate. `resampler2` uses the new (FFmpeg 7+) channel-layout API.
+        // layout/rate, using the new (FFmpeg 7+) channel-layout API.
         let out_layout = ff::ChannelLayout::default_for_channels(out.channels as u32);
-        let resampler = decoder
-            .resampler2(
-                ff::format::Sample::F32(ff::format::sample::Type::Packed),
-                out_layout,
-                out.rate,
-            )
-            .map_err(|e| e.to_string())?;
+        // The source layout can be "unspecified" (raw WAV, some mono streams); its
+        // `mask()` is then `None`, and the library's `resampler2`/`get2` panics
+        // unwrapping it. Substitute the standard layout for the channel count,
+        // which is always masked, so construction never panics on such files.
+        let src_layout = match decoder.ch_layout().mask() {
+            Some(_) => decoder.ch_layout(),
+            None => ff::ChannelLayout::default_for_channels(decoder.ch_layout().channels()),
+        };
+        let resampler = ff::software::resampling::Context::get2(
+            decoder.format(),
+            src_layout,
+            decoder.rate(),
+            ff::format::Sample::F32(ff::format::sample::Type::Packed),
+            out_layout,
+            out.rate,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(AudioDec { decoder, resampler })
     }
 
-    fn push_audio(a: &mut AudioDec, out: &AudioOut, aframe: &ff::frame::Audio) {
+    fn push_audio(a: &mut AudioDec, out: &AudioOut, aframe: &mut ff::frame::Audio) {
+        // Raw PCM (e.g. a mono WAV) often decodes with an *unspecified* channel
+        // layout (mask `None`). The resampler was configured with the canonical
+        // layout for that channel count (see `setup_audio`), so handing it an
+        // unspecified-layout frame makes `run` fail with "Input changed" and we
+        // silently drop every sample — the clock never advances and the seek bar
+        // never moves. Normalise the frame to that same canonical layout first.
+        if aframe.ch_layout().mask().is_none() {
+            let ch = aframe.ch_layout().channels();
+            aframe.set_ch_layout(ff::ChannelLayout::default_for_channels(ch));
+        }
         let mut resampled = ff::frame::Audio::empty();
         if a.resampler.run(aframe, &mut resampled).is_err() {
             return;

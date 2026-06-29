@@ -14,6 +14,15 @@ egui_extras = { version = "0.29", default-features = false }
 egui_commonmark = { version = "0.18", default-features = false }
 rfd = "0.15"
 mimalloc = "0.1"
+# PNG encoder for the `--screenshot` capture mode (render a file, grab the
+# framebuffer, write it out). Only the png codec is needed here.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Headless screenshot mode (`--headless`): render egui to an offscreen FBO with no
+# window/compositor. `egui_glow` is the same painter eframe uses; `khronos-egl`
+# (static-linked libEGL) creates a surfaceless GL context so it works on a server
+# with no display. `glow` is re-used from eframe (same 0.14 crate) for GL calls.
+egui_glow = { version = "0.29", default-features = false }
+khronos-egl = { version = "6", features = ["static"] }
 # The video sink end of the media data plane: receives Arc-backed `Frame`s off a
 # latest-wins channel fed by the playback worker in viewer-core. Vendored in
 # this workspace (crates/micro-media) so the repo builds self-contained.
