@@ -140,11 +140,20 @@ pub fn decode_svg(bytes: &[u8]) -> Decoded {
     };
 
     let size = tree.size();
-    // Render at a resolution that stays crisp under moderate zoom.
-    let max_dim = size.width().max(size.height()).max(1.0);
-    let scale = (2048.0 / max_dim).clamp(1.0, 8.0);
-    let pw = (size.width() * scale).ceil().max(1.0) as u32;
-    let ph = (size.height() * scale).ceil().max(1.0) as u32;
+    // Rasterise to a fixed *pixel-area* budget, not a fixed longest side: render
+    // cost is ~linear in area, and the old "scale the long side to 2048" rule made
+    // a 256² icon a 2048²=16 MP (64 MB) pixmap that takes ~0.9 s to fill (vs ~0.12 s
+    // at 1024²), while leaving genuinely large SVGs at full native size. Capping by
+    // area upscales small SVGs for crispness yet keeps the worst case bounded; the
+    // per-side clamp keeps the result a valid GPU texture.
+    const MAX_AREA: f32 = 1_500_000.0; // ~1.5 MP, e.g. ~1224²
+    let w = size.width().max(1.0);
+    let h = size.height().max(1.0);
+    let by_area = (MAX_AREA / (w * h)).sqrt();
+    let by_side = GPU_MAX_SIDE as f32 / w.max(h);
+    let scale = by_area.min(by_side).clamp(0.1, 8.0);
+    let pw = (w * scale).ceil().max(1.0) as u32;
+    let ph = (h * scale).ceil().max(1.0) as u32;
 
     let mut pixmap = match tiny_skia::Pixmap::new(pw, ph) {
         Some(p) => p,
